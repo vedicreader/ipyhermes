@@ -37,6 +37,7 @@ DEFAULT_SEARCH = "l"
 DEFAULT_CODE_THEME = "monokai"
 DEFAULT_LOG_EXACT = False
 DEFAULT_PROMPT_MODE = False
+DEFAULT_CAVEMAN = False
 
 _COMPLETION_SP = "You are a code completion engine for IPython. Return ONLY the completion text that should be inserted at the cursor position. No explanation, no markdown, no code fences, no prefix repetition."
 
@@ -384,7 +385,8 @@ def _default_config():
     return dict(model=DEFAULT_MODEL, plan_model=DEFAULT_PLAN_MODEL,
         complete_model=DEFAULT_COMPLETE_MODEL, provider=DEFAULT_PROVIDER,
         think=DEFAULT_THINK, search=DEFAULT_SEARCH, code_theme=DEFAULT_CODE_THEME,
-        log_exact=DEFAULT_LOG_EXACT, prompt_mode=DEFAULT_PROMPT_MODE)
+        log_exact=DEFAULT_LOG_EXACT, prompt_mode=DEFAULT_PROMPT_MODE,
+        caveman=DEFAULT_CAVEMAN)
 
 
 def load_config(path=None) -> dict:
@@ -404,6 +406,7 @@ def load_config(path=None) -> dict:
     cfg["code_theme"] = str(cfg["code_theme"]).strip() or DEFAULT_CODE_THEME
     cfg["log_exact"] = _validate_bool("log_exact", cfg["log_exact"], DEFAULT_LOG_EXACT)
     cfg["prompt_mode"] = _validate_bool("prompt_mode", cfg["prompt_mode"], DEFAULT_PROMPT_MODE)
+    cfg["caveman"] = _validate_bool("caveman", cfg["caveman"], DEFAULT_CAVEMAN)
     return cfg
 
 
@@ -619,7 +622,7 @@ def _inject_shortcutpy(ns:dict):
 
 
 # ── System prompt builder ────────────────────────────────────────────────────
-def _build_sysp(base:str, skills:list) -> str:
+def _build_sysp(base:str, skills:list, caveman:bool=False) -> str:
     parts = [base]
     if skills: parts.append(_skills_xml(skills))
     parts.append("""
@@ -636,6 +639,11 @@ After implementation: log_decision('<why>').
 compile_file(path) builds + signs an Apple Shortcut from a .py DSL file.
 Use shortcut(), ask_for_text(), choose_from_menu(), show_result() in the DSL.
 </shortcutpy>""")
+    if caveman:
+        parts.append("""
+<caveman>
+Respond in caveman mode. Drop articles, filler, pleasantries. Keep technical accuracy. Code blocks unchanged. ~75% fewer tokens.
+</caveman>""")
     return ''.join(parts)
 
 
@@ -658,10 +666,11 @@ class HermesMagics(Magics):
 class HermesExtension:
     def __init__(self, shell, model=None, plan_model=None, complete_model=None,
                  provider=None, think=None, search=None, code_theme=None,
-                 log_exact=None, system_prompt=None, prompt_mode=None):
+                 log_exact=None, system_prompt=None, prompt_mode=None, caveman=None):
         self.shell, self.loaded = shell, False
         cfg = load_config(CONFIG_PATH)
         self.prompt_mode    = cfg['prompt_mode'] ^ bool(prompt_mode)
+        self.caveman        = _validate_bool("caveman", caveman if caveman is not None else cfg['caveman'], DEFAULT_CAVEMAN)
         self.model          = model or cfg['model']
         self.plan_model     = plan_model or cfg['plan_model']
         self.complete_model = complete_model or cfg['complete_model']
@@ -1017,6 +1026,7 @@ class HermesExtension:
             ("search <l|m|h>",     "Set search level"),
             ("code_theme <name>",  "Set syntax theme"),
             ("prompt",             "Toggle prompt mode"),
+            ("caveman",            "Toggle caveman mode (~75% fewer tokens)"),
             ("save <file>",        "Save session to .ipynb"),
             ("load <file>",        "Load session from .ipynb"),
             ("reset",              "Clear AI prompts from current session"),
@@ -1031,11 +1041,16 @@ class HermesExtension:
         line = line.strip()
         if not line:
             for o in _STATUS_ATTRS: self._show(o)
+            self._show("caveman")
             print(f"{CONFIG_PATH=}")
             print(f"{SYSP_PATH=}")
             return print(f"{LOG_PATH=}")
         if line in _STATUS_ATTRS: return self._show(line)
         if line == "prompt": return self._toggle_prompt_mode()
+        if line == "caveman":
+            self.caveman = not self.caveman
+            state = "ON" if self.caveman else "OFF"
+            return print(f"Caveman mode {state}")
         if line == "reset":
             n = self.reset_session_history()
             return print(f"Deleted {n} AI prompts from session {self.session_number}.")
@@ -1071,6 +1086,7 @@ class HermesExtension:
                 think=lambda: _validate_level("think", clean, self.think),
                 search=lambda: _validate_level("search", clean, self.search),
                 log_exact=lambda: _validate_bool("log_exact", clean, self.log_exact),
+                caveman=lambda: _validate_bool("caveman", clean, self.caveman),
             )
             if cmd in vals:
                 result = self._set(cmd, vals[cmd]())
@@ -1116,7 +1132,7 @@ class HermesExtension:
         full_prompt = self.format_prompt(prompt, self.last_prompt_line()+1, history_line)
         full_prompt = warnings + prefix + full_prompt
         ns[LAST_PROMPT] = prompt
-        sp = _build_sysp(self.system_prompt, self.skills)
+        sp = _build_sysp(self.system_prompt, self.skills, caveman=self.caveman)
         agent = self._plan if is_plan else self._exec
         # Stream via astream → Rich Live markdown
         loop = asyncio.get_running_loop()
