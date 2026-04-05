@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "ipyhermes"
+version = "0.1.0"
+description = "IPython REPL extension powered by hermes-agent + OpenAI Codex"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "hermes-agent>=0.1",
+    "ipython>=8.0",
+    "ipythonng",
+    "safepyrun",
+    "safecmd",
+    "pshnb",
+    "pyskills",
+    "shortcutpy",
+    "fastcore>=1.7",
+    "karma",
+    "webba",
+    "litesearch",
+    "rich>=13.0",
+    "toolslm",
+    "mistletoe",
+    "pyyaml",
+]
+
+[project.scripts]
+ipyhermes = "ipyhermes.cli:run"
+
+[tool.setuptools.packages.find]
+include = ["ipyhermes*"]
+
+[tool.setuptools.package-data]
+ipyhermes = ["_skills/**/*", "_hermes_skills/**/*"]
+
+[tool.chkstyle]
+skip_paths = ["_skills", "_hermes_skills"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
