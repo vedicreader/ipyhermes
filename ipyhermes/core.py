@@ -580,7 +580,10 @@ def _make_approval_cb():
 # ── Agent factory ────────────────────────────────────────────────────────────
 def _mk_agent(model:str, provider:str, toolsets:list, approval_cb=None):
     "Instantiate AIAgent with correct kwargs."
-    from run_agent import AIAgent
+    try:
+        from run_agent import AIAgent
+    except ImportError:
+        raise ImportError("hermes-agent is required for agent creation. Install it with: pip install hermes-agent")
     return AIAgent(model=model, provider=provider,
                    enabled_toolsets=toolsets,
                    tool_start_callback=approval_cb,
