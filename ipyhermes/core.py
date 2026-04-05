@@ -581,17 +581,24 @@ def _make_approval_cb():
 
 
 # ── Agent factory ────────────────────────────────────────────────────────────
-def _mk_agent(model:str, provider:str, toolsets:list, approval_cb=None):
+def _mk_agent(model:str, provider:str, toolsets:list, approval_cb=None, session_id:str=None):
     "Instantiate AIAgent with correct kwargs."
     try:
         from run_agent import AIAgent
     except ImportError:
         raise ImportError("hermes-agent is required for agent creation. Install it with: pip install hermes-agent")
-    return AIAgent(model=model, provider=provider,
-                   enabled_toolsets=toolsets,
-                   tool_start_callback=approval_cb,
-                   quiet_mode=True,
-                   skip_memory=True)
+    kw = dict(model=model, provider=provider,
+              enabled_toolsets=toolsets,
+              tool_start_callback=approval_cb,
+              quiet_mode=True)
+    if session_id is not None:
+        kw["session_id"] = session_id
+    return AIAgent(**kw)
+
+
+def _hermes_session_id(session_number) -> str:
+    "Derive a hermes-agent session_id from an IPython session number."
+    return f"ipyhermes-{session_number}"
 
 
 # ── Namespace injection ──────────────────────────────────────────────────────
@@ -682,12 +689,15 @@ class HermesExtension:
         self.system_prompt  = system_prompt if system_prompt is not None else load_sysp(SYSP_PATH)
         self.skills         = _discover_skills()
         self._hist          = []  # hermes conversation_history (multi-turn)
-        # ── agents ─────────────────────────────────────────────────────────
+        # ── agents (hermes-agent memory enabled via session_id) ────────────
+        sid = _hermes_session_id(shell.history_manager.session_number)
         self._exec = _mk_agent(self.model, self.provider,
                                ['terminal', 'web', 'execute_code', 'browser'],
-                               _make_approval_cb())
-        self._plan = _mk_agent(self.plan_model, DEFAULT_PLAN_PROVIDER, ['web'])
-        self._fast = _mk_agent(self.complete_model, self.provider, [])
+                               _make_approval_cb(), session_id=sid)
+        self._plan = _mk_agent(self.plan_model, DEFAULT_PLAN_PROVIDER, ['web'],
+                               session_id=sid)
+        self._fast = _mk_agent(self.complete_model, self.provider, [],
+                               session_id=sid)
         # ── namespace ──────────────────────────────────────────────────────
         ns = shell.user_ns
         if self.skills: ns['load_skill'] = load_skill
@@ -843,6 +853,7 @@ class HermesExtension:
         self.shell.user_ns.pop(LAST_PROMPT, None)
         self.shell.user_ns.pop(LAST_RESPONSE, None)
         self.shell.user_ns[RESET_LINE_NS] = self.current_prompt_line()
+        self._hist.clear()
         return cur.rowcount or 0
 
     # ── Keybindings ────────────────────────────────────────────────────────
@@ -1091,14 +1102,17 @@ class HermesExtension:
             if cmd in vals:
                 result = self._set(cmd, vals[cmd]())
                 # Hot-swap agents when model/provider changes
+                sid = _hermes_session_id(self.session_number)
                 if cmd in ('model', 'provider'):
                     self._exec = _mk_agent(self.model, self.provider,
                                            ['terminal', 'web', 'execute_code', 'browser'],
-                                           _make_approval_cb())
+                                           _make_approval_cb(), session_id=sid)
                 elif cmd == 'plan_model':
-                    self._plan = _mk_agent(self.plan_model, DEFAULT_PLAN_PROVIDER, ['web'])
+                    self._plan = _mk_agent(self.plan_model, DEFAULT_PLAN_PROVIDER, ['web'],
+                                           session_id=sid)
                 elif cmd == 'complete_model':
-                    self._fast = _mk_agent(self.complete_model, self.provider, [])
+                    self._fast = _mk_agent(self.complete_model, self.provider, [],
+                                           session_id=sid)
                 return result
         return print(f"Unknown command: {line!r}. Run %ipyhermes help for available commands.")
 

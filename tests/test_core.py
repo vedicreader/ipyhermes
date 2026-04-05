@@ -15,7 +15,7 @@ from ipyhermes.core import (EXTENSION_NS, LAST_PROMPT, LAST_RESPONSE, RESET_LINE
     _shell_names, _shell_refs, _run_shell_refs,
     transform_prompt_mode,
     _discover_skills, _skills_xml, _build_sysp, _strip_thinking, _extract_code_blocks, _eval_code_blocks, load_skill,
-    _git_repo_root, _list_sessions, resume_session)
+    _git_repo_root, _list_sessions, resume_session, _hermes_session_id)
 
 
 # ── Test doubles ─────────────────────────────────────────────────────────────
@@ -1000,6 +1000,60 @@ def test_handle_line_sessions(dummy_agent):
     out = buf.getvalue()
     assert "1" in out
     assert "hello world" in out
+
+
+# ── Tests: Hermes Session ID Bridge ──────────────────────────────────────────
+
+def test_hermes_session_id_format():
+    assert _hermes_session_id(1) == "ipyhermes-1"
+    assert _hermes_session_id(42) == "ipyhermes-42"
+    assert _hermes_session_id(0) == "ipyhermes-0"
+
+
+def test_agents_receive_session_id(monkeypatch):
+    """All three agents should be created with a session_id derived from the IPython session number."""
+    created = []
+    class TrackingAgent:
+        def __init__(self, **kw):
+            self.kw = kw
+            created.append(kw)
+        async def astream(self, prompt, sp=None, hist=None):
+            yield ""
+    monkeypatch.setattr(core, "_mk_agent", lambda *a, **kw: TrackingAgent(**kw))
+    shell = DummyShell()
+    shell.history_manager.session_number = 7
+    ext = HermesExtension(shell=shell)
+    assert len(created) == 3
+    for agent_kw in created:
+        assert agent_kw.get("session_id") == "ipyhermes-7"
+
+
+def test_hot_swap_preserves_session_id(monkeypatch, capsys):
+    """Agent hot-swap on model change should pass the current session_id."""
+    created = []
+    class TrackingAgent:
+        def __init__(self, **kw):
+            self.kw = kw
+            created.append(kw)
+        async def astream(self, prompt, sp=None, hist=None):
+            yield ""
+    monkeypatch.setattr(core, "_mk_agent", lambda *a, **kw: TrackingAgent(**kw))
+    shell = DummyShell()
+    shell.history_manager.session_number = 3
+    ext = HermesExtension(shell=shell)
+    ext.load()
+    created.clear()
+    ext.handle_line("model gpt-4o")
+    assert len(created) == 1
+    assert created[0].get("session_id") == "ipyhermes-3"
+
+
+def test_reset_clears_hist():
+    """reset_session_history should also clear the in-memory _hist list."""
+    shell, ext = mk_ext()
+    ext._hist = [dict(role="user", content="hi"), dict(role="assistant", content="hello")]
+    ext.reset_session_history()
+    assert ext._hist == []
 
 
 # ── Tests: Handle Line Commands ──────────────────────────────────────────────
