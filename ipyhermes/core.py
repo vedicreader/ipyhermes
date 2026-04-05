@@ -690,7 +690,7 @@ class HermesExtension:
         self.skills         = _discover_skills()
         self._hist          = []  # hermes conversation_history (multi-turn)
         # ── agents (hermes-agent memory enabled via session_id) ────────────
-        sid = _hermes_session_id(shell.history_manager.session_number)
+        sid = _hermes_session_id(getattr(getattr(shell, 'history_manager', None), 'session_number', 0))
         self._exec = _mk_agent(self.model, self.provider,
                                ['terminal', 'web', 'execute_code', 'browser'],
                                _make_approval_cb(), session_id=sid)
