@@ -23,6 +23,7 @@ description: "Help and documentation for ipyhermes — the IPython AI extension 
 | `%ipyhermes load <path>` | Load session notebook |
 | `%ipyhermes sessions` | List resumable sessions |
 | `%ipyhermes prompt` | Toggle prompt mode |
+| `%ipyhermes caveman` | Toggle caveman mode (~75% fewer tokens) |
 
 ## Keybindings
 

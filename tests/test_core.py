@@ -8,13 +8,13 @@ from IPython.core.inputtransformer2 import TransformerManager
 import ipyhermes.core as core
 from ipyhermes.core import (EXTENSION_NS, LAST_PROMPT, LAST_RESPONSE, RESET_LINE_NS,
     DEFAULT_CODE_THEME, DEFAULT_LOG_EXACT, DEFAULT_SEARCH, DEFAULT_SYSTEM_PROMPT, DEFAULT_THINK,
-    DEFAULT_MODEL, DEFAULT_PLAN_MODEL, DEFAULT_COMPLETE_MODEL, DEFAULT_PROVIDER,
+    DEFAULT_MODEL, DEFAULT_PLAN_MODEL, DEFAULT_COMPLETE_MODEL, DEFAULT_PROVIDER, DEFAULT_CAVEMAN,
     HermesExtension, astream_to_stdout, compact_tool_display, prompt_from_lines, transform_dots,
     _parse_skill, _allowed_tools, _tool_results, _tool_refs,
     _var_names, _var_refs, _format_var_xml,
     _shell_names, _shell_refs, _run_shell_refs,
     transform_prompt_mode,
-    _discover_skills, _skills_xml, _strip_thinking, _extract_code_blocks, _eval_code_blocks, load_skill,
+    _discover_skills, _skills_xml, _build_sysp, _strip_thinking, _extract_code_blocks, _eval_code_blocks, load_skill,
     _git_repo_root, _list_sessions, resume_session)
 
 
@@ -1052,3 +1052,56 @@ def test_unload_cleans_up():
     ext.unload()
     assert not ext.loaded
     assert EXTENSION_NS not in shell.user_ns
+
+
+# ── Tests: Caveman Mode ──────────────────────────────────────────────────────
+
+def test_caveman_default_off():
+    _,ext = mk_ext()
+    assert ext.caveman is False
+
+def test_caveman_toggle(capsys):
+    _,ext = mk_ext()
+    assert ext.caveman is False
+    ext.handle_line("caveman")
+    assert ext.caveman is True
+    assert "Caveman mode ON" in capsys.readouterr().out
+    ext.handle_line("caveman")
+    assert ext.caveman is False
+    assert "Caveman mode OFF" in capsys.readouterr().out
+
+def test_caveman_explicit_on_off(capsys):
+    _,ext = mk_ext()
+    ext.handle_line("caveman true")
+    assert ext.caveman is True
+    assert capsys.readouterr().out == "self.caveman=True\n"
+    ext.handle_line("caveman false")
+    assert ext.caveman is False
+    assert capsys.readouterr().out == "self.caveman=False\n"
+
+def test_caveman_init_flag():
+    _,ext = mk_ext(caveman=True)
+    assert ext.caveman is True
+
+def test_caveman_config_default(monkeypatch, tmp_path):
+    cfg = tmp_path / "config.json"
+    cfg.write_text('{"caveman": true}')
+    monkeypatch.setattr(core, "CONFIG_PATH", cfg)
+    shell = DummyShell()
+    ext = HermesExtension(shell=shell).load()
+    assert ext.caveman is True
+
+def test_caveman_in_status_output(capsys):
+    _,ext = mk_ext()
+    ext.handle_line("")
+    out = capsys.readouterr().out
+    assert "self.caveman=" in out
+
+def test_build_sysp_caveman_off():
+    sp = _build_sysp("base", [], caveman=False)
+    assert "<caveman>" not in sp
+
+def test_build_sysp_caveman_on():
+    sp = _build_sysp("base", [], caveman=True)
+    assert "<caveman>" in sp
+    assert "caveman mode" in sp.lower()
