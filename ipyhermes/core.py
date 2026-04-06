@@ -711,7 +711,7 @@ class HermesExtension:
         return None if hm is None else hm.db
 
     def prompt_records(self) -> list[dict]:
-        "Return in-memory prompt records. Falls back to ConversationLog when active."
+        "Return in-memory prompt records. Sources from ConversationLog when active, falls back to _prompts."
         if self._convlog is not None:
             try:
                 turns = self._convlog.get_session(n=200)
@@ -719,12 +719,16 @@ class HermesExtension:
                     recs, pair = [], {}
                     for t in turns:
                         if t['role'] == 'user':
+                            if pair.get('prompt'):  # append unpaired user prompt
+                                recs.append(pair)
                             pair = dict(prompt=t['content'], response='', history_line=0)
                         elif t['role'] == 'assistant' and pair:
                             pair['response'] = t['content']
                             recs.append(pair)
                             pair = {}
-                    # overlay history_line from in-memory if available
+                    if pair.get('prompt'):  # append trailing unpaired user prompt
+                        recs.append(pair)
+                    # overlay history_line from in-memory _prompts (karma doesn't store this)
                     for i, rec in enumerate(recs):
                         if i < len(self._prompts): rec['history_line'] = self._prompts[i]['history_line']
                     return recs

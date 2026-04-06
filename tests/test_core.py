@@ -428,7 +428,7 @@ def test_reset_clears_in_memory_prompts(capsys):
 
     assert capsys.readouterr().out == "Deleted 2 AI prompts from session 1.\n"
     assert ext.prompt_rows() == []
-    assert shell.user_ns[RESET_LINE_NS] == 1  # current_prompt_line (execution_count-1=1)
+    assert shell.user_ns[RESET_LINE_NS] == 1  # current_prompt_line() = execution_count - 1 = 2 - 1 = 1
 
 
 # ── Tests: Context XML ───────────────────────────────────────────────────────
