@@ -80,14 +80,6 @@ LAST_RESPONSE = "_ai_last_response"
 EXTENSION_NS = "_ipyhermes"
 EXTENSION_ATTR = "_ipyhermes_ext"
 RESET_LINE_NS = "_ipyhermes_reset_line"
-PROMPTS_TABLE = "ai_prompts"
-PROMPTS_COLS = ["id", "session", "prompt", "response", "history_line"]
-_PROMPTS_SQL = f"""CREATE TABLE IF NOT EXISTS {PROMPTS_TABLE} (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session INTEGER NOT NULL,
-    prompt TEXT NOT NULL,
-    response TEXT NOT NULL,
-    history_line INTEGER NOT NULL DEFAULT 0)"""
 _STATUS_ATTRS = "model plan_model complete_model provider think search code_theme log_exact".split()
 _DANGEROUS = frozenset({'terminal', 'execute_code', 'patch', 'write_file', 'create_file'})
 
@@ -97,7 +89,7 @@ SYSP_PATH = CONFIG_DIR / "sysp.txt"
 LOG_PATH = CONFIG_DIR / "exact-log.jsonl"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-__all__ = """EXTENSION_ATTR EXTENSION_NS LAST_PROMPT LAST_RESPONSE MAGIC_NAME PROMPTS_TABLE RESET_LINE_NS
+__all__ = """EXTENSION_ATTR EXTENSION_NS LAST_PROMPT LAST_RESPONSE MAGIC_NAME RESET_LINE_NS
 DEFAULT_MODEL DEFAULT_COMPLETE_MODEL HermesExtension create_extension CONFIG_PATH SYSP_PATH LOG_PATH
 is_dot_prompt load_ipython_extension prompt_from_lines astream_to_stdout transform_dots
 unload_ipython_extension""".split()
@@ -110,18 +102,6 @@ _shell_re = re.compile(r"(?<![\w`])!`([^`]+)`")
 # tool-call display regexes (simplified — hermes doesn't use lisette's re_tools)
 _tool_call_re = re.compile(r'<tool_call>.*?</tool_call>', re.DOTALL)
 _status_re = re.compile(r'<status>(.*?)</status>', re.DOTALL)
-
-
-# ── DB ───────────────────────────────────────────────────────────────────────
-def _ensure_prompts_table(db):
-    if db is None: return
-    with db:
-        db.execute(_PROMPTS_SQL)
-        cols = [o[1] for o in db.execute(f"PRAGMA table_info({PROMPTS_TABLE})")]
-        if cols != PROMPTS_COLS:
-            db.execute(f"DROP TABLE {PROMPTS_TABLE}")
-            db.execute(_PROMPTS_SQL)
-        db.execute(f"CREATE INDEX IF NOT EXISTS idx_{PROMPTS_TABLE}_session_id ON {PROMPTS_TABLE} (session, id)")
 
 
 # ── Code block extraction (mistletoe) ────────────────────────────────────────
@@ -526,8 +506,7 @@ def _git_repo_root(path):
         if (d / ".git").exists(): return str(d)
     return None
 
-_LIST_SQL = """SELECT s.session, s.start, s.end, s.num_cmds, s.remark,
-    (SELECT prompt FROM ai_prompts WHERE session=s.session ORDER BY id DESC LIMIT 1)
+_LIST_SQL = """SELECT s.session, s.start, s.end, s.num_cmds, s.remark
     FROM sessions s WHERE s.remark{w} ORDER BY s.session DESC LIMIT 20"""
 
 def _list_sessions(db, cwd):
@@ -538,16 +517,14 @@ def _list_sessions(db, cwd):
         if repo and repo != cwd: rows = db.execute(_LIST_SQL.format(w="=?"), (repo,)).fetchall()
     return rows
 
-def _fmt_session(sid, start, ncmds, last_prompt, max_prompt=60):
+def _fmt_session(sid, start, ncmds):
     "Format a session row as a display string."
-    p = (last_prompt or '').replace('\n', ' ')[:max_prompt]
-    if last_prompt and len(last_prompt) > max_prompt: p += '...'
-    return f"{sid:>6}  {str(start or '')[:19]:20}  {ncmds or 0:>5}  {p}"
+    return f"{sid:>6}  {str(start or '')[:19]:20}  {ncmds or 0:>5}"
 
 def _pick_session(rows):
     "Show an interactive session picker, return chosen session ID or None."
     from prompt_toolkit.shortcuts import radiolist_dialog
-    values = [(sid, _fmt_session(sid, start, ncmds, lp)) for sid,start,end,ncmds,remark,lp in rows]
+    values = [(sid, _fmt_session(sid, start, ncmds)) for sid,start,end,ncmds,remark in rows]
     return radiolist_dialog(title="Resume session", text="Select a session to resume:", values=values, default=values[0][0]).run()
 
 def resume_session(shell, session_id):
@@ -610,6 +587,13 @@ def _inject_karma(ns:dict):
                    add_practice, log_decision, query_practices, search_decisions):
             ns.setdefault(fn.__name__, fn)
     except ImportError: pass
+
+def _mk_convlog(session_id):
+    "Create a karma ConversationLog if available, else None."
+    try:
+        from karma.conversation import ConversationLog
+        return ConversationLog(session_id=session_id)
+    except ImportError: return None
 
 def _inject_webba(ns:dict):
     try:
@@ -688,7 +672,8 @@ class HermesExtension:
         self.log_exact      = _validate_bool("log_exact", log_exact if log_exact is not None else cfg['log_exact'], DEFAULT_LOG_EXACT)
         self.system_prompt  = system_prompt if system_prompt is not None else load_sysp(SYSP_PATH)
         self.skills         = _discover_skills()
-        self._hist          = []  # hermes conversation_history (multi-turn)
+        self._prompts       = []  # in-memory prompt records [{prompt, response, history_line}, ...]
+        self._convlog       = None  # karma ConversationLog (set by `%ipyhermes memory on`)
         # ── agents (hermes-agent memory enabled via session_id) ────────────
         sid = _hermes_session_id(getattr(getattr(shell, 'history_manager', None), 'session_number', 0))
         self._exec = _mk_agent(self.model, self.provider,
@@ -725,20 +710,34 @@ class HermesExtension:
         hm = self.history_manager
         return None if hm is None else hm.db
 
-    def ensure_prompt_table(self): _ensure_prompts_table(self.db)
+    def prompt_records(self) -> list[dict]:
+        "Return in-memory prompt records. Falls back to ConversationLog when active."
+        if self._convlog is not None:
+            try:
+                turns = self._convlog.get_session(n=200)
+                if turns:
+                    recs, pair = [], {}
+                    for t in turns:
+                        if t['role'] == 'user':
+                            pair = dict(prompt=t['content'], response='', history_line=0)
+                        elif t['role'] == 'assistant' and pair:
+                            pair['response'] = t['content']
+                            recs.append(pair)
+                            pair = {}
+                    # overlay history_line from in-memory if available
+                    for i, rec in enumerate(recs):
+                        if i < len(self._prompts): rec['history_line'] = self._prompts[i]['history_line']
+                    return recs
+            except Exception: pass
+        return list(self._prompts)
 
-    def prompt_records(self, session: int | None=None) -> list:
-        if self.db is None: return []
-        self.ensure_prompt_table()
-        session = self.session_number if session is None else session
-        cur = self.db.execute(f"SELECT id, prompt, response, history_line FROM {PROMPTS_TABLE} WHERE session=? ORDER BY id", (session,))
-        return cur.fetchall()
+    def prompt_rows(self) -> list:
+        "Return [(prompt, response), ...] tuples."
+        return [(r['prompt'], r['response']) for r in self.prompt_records()]
 
-    def prompt_rows(self, session: int | None=None) -> list: return [(p, r) for _,p,r,_ in self.prompt_records(session=session)]
-
-    def last_prompt_line(self, session: int | None=None) -> int:
-        rows = self.prompt_records(session=session)
-        return rows[-1][3] if rows else self.reset_line
+    def last_prompt_line(self) -> int:
+        recs = self._prompts
+        return recs[-1]['history_line'] if recs else self.reset_line
 
     def current_prompt_line(self) -> int:
         c = getattr(self.shell, "execution_count", 1)
@@ -770,15 +769,16 @@ class HermesExtension:
         ctx = self.code_context(start, stop)
         return _prompt_template.format(context=ctx, prompt=prompt.strip())
 
-    def dialog_history(self) -> list:
-        hist,res = [],[]
+    def dialog_history(self) -> tuple[list, list]:
+        hist, res = [], []
         prev_line = self.reset_line
-        for pid,prompt,response,history_line in self.prompt_records():
+        for rec in self.prompt_records():
+            prompt, response, history_line = rec['prompt'], rec['response'], rec['history_line']
             if not response.strip(): response = "<system>user interrupted</system>"
             hist += [self.format_prompt(prompt, prev_line+1, history_line), response]
-            res.append(dict(id=pid, prompt=prompt, response=response, history_line=history_line))
+            res.append(dict(prompt=prompt, response=response, history_line=history_line))
             prev_line = history_line
-        return hist,res
+        return hist, res
 
     def note_strings(self, start, stop):
         "Return note string values from code history in range."
@@ -795,11 +795,13 @@ class HermesExtension:
         return tools, bad
 
     def save_prompt(self, prompt: str, response: str, history_line: int):
-        if self.db is None: return
-        self.ensure_prompt_table()
-        with self.db:
-            self.db.execute(f"INSERT INTO {PROMPTS_TABLE} (session, prompt, response, history_line) VALUES (?, ?, ?, ?)",
-                (self.session_number, prompt, response, history_line))
+        "Append prompt record in-memory and optionally to karma ConversationLog."
+        self._prompts.append(dict(prompt=prompt, response=response, history_line=history_line))
+        if self._convlog is not None:
+            try:
+                self._convlog.add('user', prompt)
+                self._convlog.add('assistant', response)
+            except Exception: pass
 
     def startup_events(self) -> list[dict]:
         events = []
@@ -807,8 +809,9 @@ class HermesExtension:
             source,_ = pair
             if not source or _is_ipyhermes_input(source): continue
             events.append(dict(kind="code", line=line, source=source))
-        for pid,prompt,response,history_line in self.prompt_records():
-            events.append(dict(kind="prompt", id=pid, line=history_line+1, history_line=history_line, prompt=prompt, response=response))
+        for rec in self._prompts:
+            history_line = rec['history_line']
+            events.append(dict(kind="prompt", line=history_line+1, history_line=history_line, prompt=rec['prompt'], response=rec['response']))
         return sorted(events, key=_event_sort_key)
 
     def save_notebook(self, path) -> tuple[int,int]:
@@ -847,14 +850,12 @@ class HermesExtension:
         with LOG_PATH.open("a") as f: f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def reset_session_history(self) -> int:
-        if self.db is None: return 0
-        self.ensure_prompt_table()
-        with self.db: cur = self.db.execute(f"DELETE FROM {PROMPTS_TABLE} WHERE session=?", (self.session_number,))
+        n = len(self._prompts)
+        self._prompts.clear()
         self.shell.user_ns.pop(LAST_PROMPT, None)
         self.shell.user_ns.pop(LAST_RESPONSE, None)
         self.shell.user_ns[RESET_LINE_NS] = self.current_prompt_line()
-        self._hist.clear()
-        return cur.rowcount or 0
+        return n
 
     # ── Keybindings ────────────────────────────────────────────────────────
     def _register_keybindings(self):
@@ -959,7 +960,6 @@ class HermesExtension:
     # ── Load/Unload ────────────────────────────────────────────────────────
     def load(self):
         if self.loaded: return self
-        self.ensure_prompt_table()
         cts = self.shell.input_transformer_manager.cleanup_transforms
         if self.prompt_mode:
             if transform_prompt_mode not in cts: cts.insert(0, transform_prompt_mode)
@@ -1038,10 +1038,10 @@ class HermesExtension:
             ("code_theme <name>",  "Set syntax theme"),
             ("prompt",             "Toggle prompt mode"),
             ("caveman",            "Toggle caveman mode (~75% fewer tokens)"),
+            ("memory on|off",      "Toggle karma ConversationLog integration"),
             ("save <file>",        "Save session to .ipynb"),
             ("load <file>",        "Load session from .ipynb"),
             ("reset",              "Clear AI prompts from current session"),
-            ("clear-history",      "Clear hermes conversation history"),
             ("sessions",           "List previous sessions"),
         ]
         print("Usage: %ipyhermes <command>\n")
@@ -1053,6 +1053,7 @@ class HermesExtension:
         if not line:
             for o in _STATUS_ATTRS: self._show(o)
             self._show("caveman")
+            print(f"memory={'on' if self._convlog is not None else 'off'}")
             print(f"{CONFIG_PATH=}")
             print(f"{SYSP_PATH=}")
             return print(f"{LOG_PATH=}")
@@ -1065,17 +1066,25 @@ class HermesExtension:
         if line == "reset":
             n = self.reset_session_history()
             return print(f"Deleted {n} AI prompts from session {self.session_number}.")
-        if line == "clear-history":
-            self._hist.clear()
-            return print("Hermes conversation history cleared.")
         if line == "sessions":
             rows = _list_sessions(self.db, os.getcwd())
             if not rows: return print("No sessions found for this directory.")
-            print(f"{'ID':>6}  {'Start':20}  {'Cmds':>5}  {'Last prompt'}")
-            for sid,start,end,ncmds,remark,lp in rows: print(_fmt_session(sid, start, ncmds, lp))
+            print(f"{'ID':>6}  {'Start':20}  {'Cmds':>5}")
+            for sid,start,end,ncmds,remark in rows: print(_fmt_session(sid, start, ncmds))
             return
         cmd,_,arg = line.partition(" ")
         clean = arg.strip()
+        if cmd == "memory":
+            if clean.lower() in ('on', 'true', '1'):
+                sid = _hermes_session_id(self.session_number)
+                self._convlog = _mk_convlog(sid)
+                state = "on (karma)" if self._convlog else "on (karma not installed, using in-memory only)"
+                return print(f"Memory {state}")
+            elif clean.lower() in ('off', 'false', '0'):
+                self._convlog = None
+                return print("Memory off")
+            else:
+                return print(f"memory={'on' if self._convlog is not None else 'off'}")
         if cmd == "save":
             if not clean: return print("Usage: %ipyhermes save <filename>")
             path, ncode, nprompt = self.save_notebook(clean)
@@ -1154,7 +1163,7 @@ class HermesExtension:
         loop.add_signal_handler(signal.SIGINT, task.cancel)
         partial = []
         try:
-            chunks = agent.astream(full_prompt, sp=sp, hist=self._hist or None)
+            chunks = agent.astream(full_prompt, sp=sp, hist=None)
             with _suppress_output_history(self.shell):
                 text = await astream_to_stdout(chunks, code_theme=self.code_theme, partial=partial)
         except asyncio.CancelledError:
@@ -1167,7 +1176,6 @@ class HermesExtension:
         if ng: ng._pty_output = _strip_thinking(text)
         self.log_exact_exchange(full_prompt, text)
         self.save_prompt(prompt, text, history_line)
-        self._hist += [dict(role='user', content=full_prompt), dict(role='assistant', content=text)]
         return None
 
 
@@ -1175,7 +1183,6 @@ class HermesExtension:
 def create_extension(shell=None, resume=None, load=None, prompt_mode=False, **kwargs):
     shell = shell or get_ipython()
     if shell is None: raise RuntimeError("No active IPython shell found")
-    _ensure_prompts_table(shell.history_manager.db)
     if resume is not None:
         if resume == -1:
             rows = _list_sessions(shell.history_manager.db, os.getcwd())
