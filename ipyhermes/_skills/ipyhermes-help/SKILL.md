@@ -35,8 +35,8 @@ description: "Help and documentation for ipyhermes — the IPython AI extension 
 | Binding | Action |
 |---|---|
 | `Alt-.` | AI inline completion |
-| `Alt-W` | Paste all code blocks from last response |
-| `Alt-1..9` | Paste nth code block |
+| `Alt-Shift-W` | Paste all code blocks from last response |
+| `Alt-Shift-1..9` | Paste nth code block |
 | `Alt-Shift-↑/↓` | Cycle through code blocks |
 | `Alt-↑/↓` | Jump through history entries |
 | `Alt-P` | Toggle prompt mode |
