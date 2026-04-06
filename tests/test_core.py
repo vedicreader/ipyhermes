@@ -1171,16 +1171,17 @@ def test_inject_bgterm_adds_functions(monkeypatch):
 
 def test_inject_bgterm_noop_when_missing(monkeypatch):
     """_inject_bgterm should silently skip when bgterm not installed."""
+    import builtins
+    _orig_import = builtins.__import__
+    def _raise_for_bgterm(name, *a, **kw):
+        if name == 'bgterm' or name.startswith('bgterm.'):
+            raise ImportError(f"No module named '{name}'")
+        return _orig_import(name, *a, **kw)
     monkeypatch.delitem(sys.modules, 'bgterm', raising=False)
-    monkeypatch.setattr('builtins.__import__', _import_raiser('bgterm'), raising=False)
+    monkeypatch.setattr(builtins, '__import__', _raise_for_bgterm)
     ns = {}
-    # Should not raise, just skip
-    try:
-        core._inject_bgterm(ns)
-    except ImportError:
-        pass
-    # If bgterm is truly not installed, ns should be empty or have only functions from installed bgterm
-    # The key point: no crash
+    core._inject_bgterm(ns)
+    assert 'start_bgterm' not in ns
 
 
 def test_inject_exhash_adds_functions(monkeypatch):
@@ -1218,16 +1219,6 @@ def test_inject_bhoga_adds_router(monkeypatch):
     assert 'bhoga_router' in ns
     assert 'apply_to_hermes' in ns
     assert isinstance(ns['bhoga_router'], FakeRouter)
-
-
-def _import_raiser(mod_name):
-    """Create an __import__ replacement that raises ImportError for a specific module."""
-    _orig = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
-    def _mock_import(name, *args, **kwargs):
-        if name == mod_name or name.startswith(mod_name + '.'):
-            raise ImportError(f"No module named '{mod_name}'")
-        return _orig(name, *args, **kwargs)
-    return _mock_import
 
 
 # ── Tests: Phase 1 - system prompt includes new tool docs ───────────────────

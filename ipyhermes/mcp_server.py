@@ -1,5 +1,6 @@
 "MCP server exposing ipyhermes/karma tools via Model Context Protocol."
 import json
+import sys
 
 __all__ = ['create_server', 'main']
 
@@ -131,7 +132,7 @@ def main():
         try:
             from mcp.server.stdio import stdio_server
         except ImportError:
-            print("mcp package is required. Install with: pip install mcp", file=__import__('sys').stderr)
+            print("mcp package is required. Install with: pip install mcp", file=sys.stderr)
             raise SystemExit(1)
 
         server = create_server()

@@ -48,10 +48,10 @@ class ToolCallLog:
             args = dict(sid=sid)
         try:
             sql = self._store.search_sql(order_by='rank', limit=k, where=where)
-            rows = list(self._db.execute(sql, dict(query=query, **(args or {}))).fetchall())
-            cols = [d[0] for d in self._db.execute(sql, dict(query=query, **(args or {}))).description]
+            cur = self._db.execute(sql, dict(query=query, **(args or {})))
+            cols = [d[0] for d in cur.description]
             results = []
-            for row in rows:
+            for row in cur.fetchall():
                 rec = dict(zip(cols, row))
                 try:
                     rec['metadata'] = json.loads(rec.get('metadata', '{}'))
@@ -73,10 +73,10 @@ class ToolCallLog:
             params['sid'] = sid
         try:
             sql = f"SELECT * FROM tool_calls {where_clause} ORDER BY rowid DESC LIMIT :n"
-            rows = list(self._db.execute(sql, params).fetchall())
-            cols = [d[0] for d in self._db.execute(sql, params).description] if rows else []
+            cur = self._db.execute(sql, params)
+            cols = [d[0] for d in cur.description]
             results = []
-            for row in rows:
+            for row in cur.fetchall():
                 rec = dict(zip(cols, row))
                 try:
                     rec['metadata'] = json.loads(rec.get('metadata', '{}'))
