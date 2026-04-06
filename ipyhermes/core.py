@@ -611,6 +611,70 @@ def _inject_shortcutpy(ns:dict):
             ns.setdefault(obj.__name__, obj)
     except ImportError: pass
 
+def _inject_bgterm(ns:dict):
+    "Inject bgterm persistent background shell session tools into namespace."
+    try:
+        from bgterm import start_bgterm, write_stdin, close_bgterm
+        for fn in (start_bgterm, write_stdin, close_bgterm):
+            ns.setdefault(fn.__name__, fn)
+    except ImportError: pass
+
+def _inject_exhash(ns:dict):
+    "Inject exhash hash-addressed file editing tools into namespace."
+    try:
+        from exhash import lnhashview_file, exhash_file
+        for fn in (lnhashview_file, exhash_file):
+            ns.setdefault(fn.__name__, fn)
+    except ImportError: pass
+
+def _inject_bhoga(ns:dict):
+    "Inject bhoga quota-aware provider routing into namespace."
+    try:
+        from bhoga import Router, apply_to_hermes
+        ns.setdefault('bhoga_router', Router())
+        ns.setdefault('apply_to_hermes', apply_to_hermes)
+    except ImportError: pass
+
+
+# ── MCP (solvemcp) ───────────────────────────────────────────────────────────
+def _connect_mcp(uri:str):
+    """Connect to an MCP server by URI. Returns (MCPClient, dict_of_callables) or raises."""
+    from solvemcp import MCPClient
+    if uri.startswith(("http://", "https://")):
+        client = MCPClient.http(uri)
+    else:
+        client = MCPClient.stdio(uri.split())
+    tools = {}
+    for name, spec in client.tools.items():
+        fn = getattr(client, name, None)
+        if callable(fn): tools[name] = fn
+    return client, tools
+
+def _inject_mcp(ns:dict, mcp_clients:dict):
+    """Connect to MCP servers from IPYHERMES_MCP env var and inject tools.
+
+    ``mcp_clients`` is mutated: server-URI → MCPClient for lifecycle management.
+    """
+    raw = os.environ.get('IPYHERMES_MCP', '')
+    if not raw: return
+    try:
+        from solvemcp import MCPClient  # noqa: F401 — availability check
+    except ImportError: return
+    for uri in (u.strip() for u in raw.split(',') if u.strip()):
+        try:
+            client, tools = _connect_mcp(uri)
+            mcp_clients[uri] = client
+            for tname, fn in tools.items(): ns.setdefault(tname, fn)
+        except Exception as exc:
+            print(f"[ipyhermes] MCP connect failed for {uri}: {exc}")
+
+def _close_mcp_clients(mcp_clients:dict):
+    "Close all open MCP clients."
+    for client in mcp_clients.values():
+        try: client.close()
+        except Exception: pass
+    mcp_clients.clear()
+
 
 # ── System prompt builder ────────────────────────────────────────────────────
 def _build_sysp(base:str, skills:list, caveman:bool=False) -> str:
@@ -629,7 +693,25 @@ After implementation: log_decision('<why>').
 <shortcutpy>
 compile_file(path) builds + signs an Apple Shortcut from a .py DSL file.
 Use shortcut(), ask_for_text(), choose_from_menu(), show_result() in the DSL.
-</shortcutpy>""")
+</shortcutpy>
+<bgterm>
+start_bgterm(name) opens a persistent background shell session.
+write_stdin(name, text) sends input to it.
+close_bgterm(name) closes it.
+Use for multi-step workflows: build → check errors → fix → re-run.
+</bgterm>
+<exhash>
+lnhashview_file(path) shows file with line hashes (immune to line number drift).
+exhash_file(path, cmds) edits file using hash-addressed lines.
+Prefer exhash_file over ex/sed for safer multi-line edits.
+</exhash>
+<bhoga>
+bhoga_router is a quota-aware provider router. apply_to_hermes(bhoga_router, model) writes best provider to hermes config.
+</bhoga>
+<mcp>
+MCP servers can be connected via %ipyhermes mcp connect <url>. Their tools are injected into the namespace and usable with &`tool_name` references.
+Use %ipyhermes mcp to list connected servers. Use %ipyhermes mcp disconnect <url> to close a connection.
+</mcp>""")
     if caveman:
         parts.append("""
 <caveman>
@@ -673,9 +755,10 @@ class HermesExtension:
         self.system_prompt  = system_prompt if system_prompt is not None else load_sysp(SYSP_PATH)
         self.skills         = _discover_skills()
         self._prompts       = []  # in-memory prompt records [{prompt, response, history_line}, ...]
-        self._convlog       = None  # karma ConversationLog (set by `%ipyhermes memory on`)
-        # ── agents (hermes-agent memory enabled via session_id) ────────────
+        # ── karma ConversationLog (always-on when karma is installed) ──
         sid = _hermes_session_id(getattr(getattr(shell, 'history_manager', None), 'session_number', 0))
+        self._convlog       = _mk_convlog(sid)
+        # ── agents (hermes-agent memory enabled via session_id) ────────────
         self._exec = _mk_agent(self.model, self.provider,
                                ['terminal', 'web', 'execute_code', 'browser'],
                                _make_approval_cb(), session_id=sid)
@@ -689,6 +772,12 @@ class HermesExtension:
         _inject_karma(ns)
         _inject_webba(ns)
         _inject_shortcutpy(ns)
+        _inject_bgterm(ns)
+        _inject_exhash(ns)
+        _inject_bhoga(ns)
+        # ── MCP servers (solvemcp) ─────────────────────────────────────────
+        self._mcp_clients = {}
+        _inject_mcp(ns, self._mcp_clients)
         try:
             from safecmd import bash, ex, sed
             from pyskills import doc
@@ -987,6 +1076,7 @@ class HermesExtension:
         if transform_prompt_mode in cts: cts.remove(transform_prompt_mode)
         if self.shell.user_ns.get(EXTENSION_NS) is self: self.shell.user_ns.pop(EXTENSION_NS, None)
         if getattr(self.shell, EXTENSION_ATTR, None) is self: delattr(self.shell, EXTENSION_ATTR)
+        _close_mcp_clients(self._mcp_clients)
         self.loaded = False
         return self
 
@@ -1042,7 +1132,9 @@ class HermesExtension:
             ("code_theme <name>",  "Set syntax theme"),
             ("prompt",             "Toggle prompt mode"),
             ("caveman",            "Toggle caveman mode (~75% fewer tokens)"),
-            ("memory on|off",      "Toggle karma ConversationLog integration"),
+            ("memory on|off",      "Toggle karma ConversationLog persistence"),
+            ("route [auto|<prov>]", "Show quota / auto-route / force provider (bhoga)"),
+            ("mcp [connect|disconnect]", "Manage MCP server connections (solvemcp)"),
             ("save <file>",        "Save session to .ipynb"),
             ("load <file>",        "Load session from .ipynb"),
             ("reset",              "Clear AI prompts from current session"),
@@ -1051,6 +1143,86 @@ class HermesExtension:
         print("Usage: %ipyhermes <command>\n")
         for cmd, desc in cmds: print(f"  {cmd:25s} {desc}")
 
+    # ── Route (bhoga) ──────────────────────────────────────────────────────
+    def _handle_route(self, arg: str):
+        "Handle %ipyhermes route [auto|<provider>]."
+        try:
+            from bhoga import Router, apply_to_hermes
+        except ImportError:
+            return print("bhoga not installed. Install with: pip install bhoga")
+        ns = self.shell.user_ns
+        router = ns.get('bhoga_router')
+        if router is None:
+            router = Router()
+            ns['bhoga_router'] = router
+        if not arg:
+            # Show quota status
+            quotas = router.quotas()
+            if not quotas: return print("No providers discovered yet.")
+            for pid, q in quotas.items():
+                pct = f"{q.remaining_pct:.0%}" if hasattr(q, 'remaining_pct') else "?"
+                status = getattr(q, 'status', 'UNKNOWN')
+                print(f"  {pid:20s}  {pct:>6}  {status}")
+            return
+        if arg == "auto":
+            rec = router.best_for(self.model)
+            if rec is None: return print(f"No provider recommendation for {self.model}")
+            apply_to_hermes(router, self.model)
+            print(f"Applied: {rec.hermes_model} ({rec.quota_pct:.0%} remaining)")
+            # Hot-swap the agent to use the new provider
+            sid = _hermes_session_id(self.session_number)
+            self._exec = _mk_agent(self.model, self.provider,
+                                   ['terminal', 'web', 'execute_code', 'browser'],
+                                   _make_approval_cb(), session_id=sid)
+            return
+        # Force provider
+        self.provider = arg
+        sid = _hermes_session_id(self.session_number)
+        self._exec = _mk_agent(self.model, self.provider,
+                               ['terminal', 'web', 'execute_code', 'browser'],
+                               _make_approval_cb(), session_id=sid)
+        return print(f"Provider forced to: {arg}")
+
+    # ── MCP (solvemcp) ────────────────────────────────────────────────────
+    def _handle_mcp(self, arg: str):
+        "Handle %ipyhermes mcp [connect <uri>|disconnect <uri>]."
+        try:
+            from solvemcp import MCPClient  # noqa: F401
+        except ImportError:
+            return print("solvemcp not installed. Install with: pip install solvemcp")
+        if not arg:
+            # List connected MCP servers and their tools
+            if not self._mcp_clients:
+                return print("No MCP servers connected.")
+            for uri, client in self._mcp_clients.items():
+                tool_names = sorted(client.tools.keys()) if hasattr(client, 'tools') else []
+                print(f"  {uri}  tools: {', '.join(tool_names) or '(none)'}")
+            return
+        sub, _, rest = arg.partition(" ")
+        rest = rest.strip()
+        if sub == "connect":
+            if not rest: return print("Usage: %ipyhermes mcp connect <url-or-command>")
+            if rest in self._mcp_clients:
+                return print(f"Already connected to {rest}")
+            try:
+                client, tools = _connect_mcp(rest)
+            except Exception as exc:
+                return print(f"MCP connect failed: {exc}")
+            self._mcp_clients[rest] = client
+            ns = self.shell.user_ns
+            for tname, fn in tools.items(): ns.setdefault(tname, fn)
+            print(f"Connected to {rest} — tools: {', '.join(sorted(tools)) or '(none)'}")
+            return
+        if sub == "disconnect":
+            if not rest: return print("Usage: %ipyhermes mcp disconnect <url-or-command>")
+            client = self._mcp_clients.pop(rest, None)
+            if client is None:
+                return print(f"Not connected to {rest}")
+            try: client.close()
+            except Exception: pass
+            return print(f"Disconnected from {rest}")
+        return print(f"Unknown mcp subcommand: {sub!r}. Use: mcp, mcp connect <uri>, mcp disconnect <uri>")
+
     # ── handle_line (magic dispatcher) ─────────────────────────────────────
     def handle_line(self, line: str):
         line = line.strip()
@@ -1058,6 +1230,8 @@ class HermesExtension:
             for o in _STATUS_ATTRS: self._show(o)
             self._show("caveman")
             print(f"memory={'on' if self._convlog is not None else 'off'}")
+            n_mcp = len(self._mcp_clients)
+            print(f"mcp={n_mcp} server{'s' if n_mcp != 1 else ''} connected")
             print(f"{CONFIG_PATH=}")
             print(f"{SYSP_PATH=}")
             return print(f"{LOG_PATH=}")
@@ -1089,6 +1263,10 @@ class HermesExtension:
                 return print("Memory off")
             else:
                 return print(f"memory={'on' if self._convlog is not None else 'off'}")
+        if cmd == "route":
+            return self._handle_route(clean)
+        if cmd == "mcp":
+            return self._handle_mcp(clean)
         if cmd == "save":
             if not clean: return print("Usage: %ipyhermes save <filename>")
             path, ncode, nprompt = self.save_notebook(clean)

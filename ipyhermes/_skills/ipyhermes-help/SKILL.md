@@ -18,12 +18,17 @@ description: "Help and documentation for ipyhermes — the IPython AI extension 
 | `%ipyhermes search l\|m\|h` | Set search level |
 | `%ipyhermes code_theme <name>` | Syntax theme |
 | `%ipyhermes reset` | Clear AI history in session |
-| `%ipyhermes memory on\|off` | Toggle karma ConversationLog integration |
 | `%ipyhermes save <path>` | Save session notebook |
 | `%ipyhermes load <path>` | Load session notebook |
 | `%ipyhermes sessions` | List resumable sessions |
 | `%ipyhermes prompt` | Toggle prompt mode |
 | `%ipyhermes caveman` | Toggle caveman mode (~75% fewer tokens) |
+| `%ipyhermes memory on\|off` | Toggle karma ConversationLog |
+| `%ipyhermes route` | Show provider quota status (bhoga) |
+| `%ipyhermes route auto` | Auto-select best provider (bhoga) |
+| `%ipyhermes mcp` | List connected MCP servers |
+| `%ipyhermes mcp connect <url>` | Connect to an MCP server |
+| `%ipyhermes mcp disconnect <url>` | Disconnect from MCP server |
 
 ## Keybindings
 

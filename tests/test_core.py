@@ -15,7 +15,8 @@ from ipyhermes.core import (EXTENSION_NS, LAST_PROMPT, LAST_RESPONSE, RESET_LINE
     _shell_names, _shell_refs, _run_shell_refs,
     transform_prompt_mode,
     _discover_skills, _skills_xml, _build_sysp, _strip_thinking, _extract_code_blocks, _eval_code_blocks, load_skill,
-    _git_repo_root, _list_sessions, resume_session, _hermes_session_id, _mk_convlog)
+    _git_repo_root, _list_sessions, resume_session, _hermes_session_id, _mk_convlog,
+    _inject_mcp, _connect_mcp, _close_mcp_clients)
 
 
 # ── Test doubles ─────────────────────────────────────────────────────────────
@@ -115,6 +116,8 @@ def _config_paths(monkeypatch, tmp_path):
         async def astream(self, prompt, sp=None, hist=None):
             yield ""
     monkeypatch.setattr(core, "_mk_agent", lambda *a, **kw: StubAgent(**kw))
+    # Stub karma so tests don't require it
+    monkeypatch.setattr(core, "_mk_convlog", lambda sid: None)
 
 
 @pytest.fixture
@@ -1139,3 +1142,471 @@ def test_build_sysp_caveman_on():
     sp = _build_sysp("base", [], caveman=True)
     assert "<caveman>" in sp
     assert "caveman mode" in sp.lower()
+
+
+# ── Tests: Phase 1 - bgterm & exhash injection ──────────────────────────────
+
+def test_inject_bgterm_adds_functions(monkeypatch):
+    """_inject_bgterm should add start_bgterm, write_stdin, close_bgterm to namespace."""
+    import types
+    fake_mod = types.ModuleType('bgterm')
+    def _start_bgterm(name): return f"started {name}"
+    def _write_stdin(name, text): return f"wrote {text}"
+    def _close_bgterm(name): return f"closed {name}"
+    _start_bgterm.__name__ = 'start_bgterm'
+    _write_stdin.__name__ = 'write_stdin'
+    _close_bgterm.__name__ = 'close_bgterm'
+    fake_mod.start_bgterm = _start_bgterm
+    fake_mod.write_stdin = _write_stdin
+    fake_mod.close_bgterm = _close_bgterm
+    monkeypatch.setitem(sys.modules, 'bgterm', fake_mod)
+
+    ns = {}
+    core._inject_bgterm(ns)
+    assert 'start_bgterm' in ns
+    assert 'write_stdin' in ns
+    assert 'close_bgterm' in ns
+    assert ns['start_bgterm']('test') == "started test"
+
+
+def test_inject_bgterm_noop_when_missing(monkeypatch):
+    """_inject_bgterm should silently skip when bgterm not installed."""
+    import builtins
+    _orig_import = builtins.__import__
+    def _raise_for_bgterm(name, *a, **kw):
+        if name == 'bgterm' or name.startswith('bgterm.'):
+            raise ImportError(f"No module named '{name}'")
+        return _orig_import(name, *a, **kw)
+    monkeypatch.delitem(sys.modules, 'bgterm', raising=False)
+    monkeypatch.setattr(builtins, '__import__', _raise_for_bgterm)
+    ns = {}
+    core._inject_bgterm(ns)
+    assert 'start_bgterm' not in ns
+
+
+def test_inject_exhash_adds_functions(monkeypatch):
+    """_inject_exhash should add lnhashview_file, exhash_file to namespace."""
+    import types
+    fake_mod = types.ModuleType('exhash')
+    def _lnhashview_file(path): return f"viewed {path}"
+    def _exhash_file(path, cmds): return f"edited {path}"
+    _lnhashview_file.__name__ = 'lnhashview_file'
+    _exhash_file.__name__ = 'exhash_file'
+    fake_mod.lnhashview_file = _lnhashview_file
+    fake_mod.exhash_file = _exhash_file
+    monkeypatch.setitem(sys.modules, 'exhash', fake_mod)
+
+    ns = {}
+    core._inject_exhash(ns)
+    assert 'lnhashview_file' in ns
+    assert 'exhash_file' in ns
+    assert ns['lnhashview_file']('test.py') == "viewed test.py"
+
+
+def test_inject_bhoga_adds_router(monkeypatch):
+    """_inject_bhoga should add bhoga_router and apply_to_hermes to namespace."""
+    import types
+    fake_mod = types.ModuleType('bhoga')
+    class FakeRouter:
+        def quotas(self): return {}
+        def best_for(self, model): return None
+    fake_mod.Router = FakeRouter
+    fake_mod.apply_to_hermes = lambda r, m: None
+    monkeypatch.setitem(sys.modules, 'bhoga', fake_mod)
+
+    ns = {}
+    core._inject_bhoga(ns)
+    assert 'bhoga_router' in ns
+    assert 'apply_to_hermes' in ns
+    assert isinstance(ns['bhoga_router'], FakeRouter)
+
+
+# ── Tests: Phase 1 - system prompt includes new tool docs ───────────────────
+
+def test_build_sysp_includes_bgterm():
+    sp = _build_sysp("base", [])
+    assert "<bgterm>" in sp
+    assert "start_bgterm" in sp
+
+def test_build_sysp_includes_exhash():
+    sp = _build_sysp("base", [])
+    assert "<exhash>" in sp
+    assert "exhash_file" in sp
+
+def test_build_sysp_includes_bhoga():
+    sp = _build_sysp("base", [])
+    assert "<bhoga>" in sp
+    assert "bhoga_router" in sp
+
+
+# ── Tests: Phase 2a - Always-on karma ConversationLog ────────────────────────
+
+def test_convlog_always_initialized(monkeypatch):
+    """ConversationLog should be initialized automatically (always-on)."""
+    class FakeConvLog:
+        def __init__(self, session_id): self.session_id = session_id
+        def get_session(self, n=50): return []
+    monkeypatch.setattr(core, "_mk_convlog", lambda sid: FakeConvLog(sid))
+    shell = DummyShell()
+    ext = HermesExtension(shell=shell)
+    assert ext._convlog is not None
+    assert ext._convlog.session_id == "ipyhermes-1"
+
+
+def test_convlog_none_when_karma_missing(monkeypatch):
+    """ConversationLog should be None if karma is not installed."""
+    monkeypatch.setattr(core, "_mk_convlog", lambda sid: None)
+    shell = DummyShell()
+    ext = HermesExtension(shell=shell)
+    assert ext._convlog is None
+
+
+def test_memory_on_off_still_works(capsys, monkeypatch):
+    """User can still toggle memory on/off for backward compat."""
+    monkeypatch.setattr(core, "_mk_convlog", lambda sid: None)
+    _,ext = mk_ext(load=False)
+    ext.handle_line("memory on")
+    out = capsys.readouterr().out
+    assert "in-memory only" in out
+    ext.handle_line("memory off")
+    assert "Memory off" in capsys.readouterr().out
+
+
+
+# ── Tests: Phase 3 - bhoga route command ─────────────────────────────────────
+
+def test_handle_route_no_bhoga(capsys, monkeypatch):
+    """route command should show error when bhoga not installed."""
+    monkeypatch.delitem(sys.modules, 'bhoga', raising=False)
+    def raise_import(name, *a, **kw):
+        if name == 'bhoga' or name.startswith('bhoga.'):
+            raise ImportError("No module named 'bhoga'")
+        return original_import(name, *a, **kw)
+    import builtins
+    original_import = builtins.__import__
+    monkeypatch.setattr(builtins, '__import__', raise_import)
+    _,ext = mk_ext(load=False)
+    ext._handle_route("")
+    out = capsys.readouterr().out
+    assert "bhoga not installed" in out
+
+
+def test_handle_route_show_quotas(capsys, monkeypatch):
+    """route command with no args should show quota status."""
+    import types
+    fake_bhoga = types.ModuleType('bhoga')
+    class FakeQuota:
+        remaining_pct = 0.75
+        status = 'OK'
+    class FakeRouter:
+        def quotas(self): return {'anthropic_api': FakeQuota()}
+        def best_for(self, model): return None
+    fake_bhoga.Router = FakeRouter
+    fake_bhoga.apply_to_hermes = lambda r, m: None
+    monkeypatch.setitem(sys.modules, 'bhoga', fake_bhoga)
+
+    _,ext = mk_ext(load=False)
+    ext.shell.user_ns['bhoga_router'] = FakeRouter()
+    ext._handle_route("")
+    out = capsys.readouterr().out
+    assert "anthropic_api" in out
+    assert "75%" in out
+
+
+def test_handle_route_force_provider(capsys, monkeypatch):
+    """route command with provider name should force that provider."""
+    import types
+    fake_bhoga = types.ModuleType('bhoga')
+    fake_bhoga.Router = type('Router', (), {'quotas': lambda self: {}})
+    fake_bhoga.apply_to_hermes = lambda r, m: None
+    monkeypatch.setitem(sys.modules, 'bhoga', fake_bhoga)
+
+    _,ext = mk_ext(load=False)
+    ext._handle_route("openai-codex")
+    assert ext.provider == "openai-codex"
+    out = capsys.readouterr().out
+    assert "Provider forced to" in out
+
+
+# ── Tests: Help text includes new commands ───────────────────────────────────
+
+def test_help_includes_route(capsys):
+    _,ext = mk_ext(load=False)
+    ext._show_help()
+    out = capsys.readouterr().out
+    assert "route" in out
+
+
+# ── Tests: Status output ────────────────────────────────────────────────────
+
+def test_status_shows_memory_state(capsys, monkeypatch):
+    """Status should show memory=on when convlog is active."""
+    class FakeConvLog:
+        def __init__(self, sid): pass
+    monkeypatch.setattr(core, "_mk_convlog", lambda sid: FakeConvLog(sid))
+    shell = DummyShell()
+    ext = HermesExtension(shell=shell).load()
+    ext.handle_line("")
+    out = capsys.readouterr().out
+    assert "memory=on" in out
+
+
+# ── Tests: MCP (solvemcp) ───────────────────────────────────────────────────
+
+def _fake_solvemcp(monkeypatch):
+    """Set up a fake solvemcp module with a mock MCPClient."""
+    import types
+    fake_mod = types.ModuleType('solvemcp')
+
+    class FakeMCPClient:
+        _instances = []
+
+        def __init__(self, uri=None):
+            self.uri = uri
+            self.tools = {'echo': types.SimpleNamespace(name='echo')}
+            self.closed = False
+            type(self)._instances.append(self)
+
+        def echo(self, text=""): return {'content': [{'type': 'text', 'text': text}]}
+
+        def close(self): self.closed = True
+
+        @classmethod
+        def http(cls, url, **kw):
+            c = cls(uri=url)
+            setattr(c, 'echo', c.echo)
+            return c
+
+        @classmethod
+        def stdio(cls, cmd, **kw):
+            c = cls(uri=' '.join(cmd) if isinstance(cmd, list) else cmd)
+            setattr(c, 'echo', c.echo)
+            return c
+
+    fake_mod.MCPClient = FakeMCPClient
+    monkeypatch.setitem(sys.modules, 'solvemcp', fake_mod)
+    return FakeMCPClient
+
+
+def test_inject_mcp_connects_from_env(monkeypatch):
+    """_inject_mcp should connect to servers from IPYHERMES_MCP env var."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    monkeypatch.setenv('IPYHERMES_MCP', 'https://mcp.example.com')
+
+    ns = {}
+    clients = {}
+    _inject_mcp(ns, clients)
+    assert 'https://mcp.example.com' in clients
+    assert 'echo' in ns
+    assert callable(ns['echo'])
+
+
+def test_inject_mcp_multiple_servers(monkeypatch):
+    """_inject_mcp should connect to multiple comma-separated servers."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    monkeypatch.setenv('IPYHERMES_MCP', 'https://a.com, https://b.com')
+
+    ns = {}
+    clients = {}
+    _inject_mcp(ns, clients)
+    assert len(clients) == 2
+    assert 'https://a.com' in clients
+    assert 'https://b.com' in clients
+
+
+def test_inject_mcp_noop_when_missing(monkeypatch):
+    """_inject_mcp should silently skip when solvemcp not installed."""
+    import builtins
+    _orig_import = builtins.__import__
+    def _raise_for_solvemcp(name, *a, **kw):
+        if name == 'solvemcp' or name.startswith('solvemcp.'):
+            raise ImportError(f"No module named '{name}'")
+        return _orig_import(name, *a, **kw)
+    monkeypatch.delitem(sys.modules, 'solvemcp', raising=False)
+    monkeypatch.setattr(builtins, '__import__', _raise_for_solvemcp)
+    monkeypatch.setenv('IPYHERMES_MCP', 'https://mcp.example.com')
+
+    ns = {}
+    clients = {}
+    _inject_mcp(ns, clients)
+    assert len(clients) == 0
+    assert 'echo' not in ns
+
+
+def test_inject_mcp_noop_when_no_env(monkeypatch):
+    """_inject_mcp should do nothing when IPYHERMES_MCP is not set."""
+    _fake_solvemcp(monkeypatch)
+    monkeypatch.delenv('IPYHERMES_MCP', raising=False)
+
+    ns = {}
+    clients = {}
+    _inject_mcp(ns, clients)
+    assert len(clients) == 0
+
+
+def test_inject_mcp_stdio_fallback(monkeypatch):
+    """_inject_mcp should use stdio for non-http URIs."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    monkeypatch.setenv('IPYHERMES_MCP', 'python -m my_server')
+
+    ns = {}
+    clients = {}
+    _inject_mcp(ns, clients)
+    assert 'python -m my_server' in clients
+    assert 'echo' in ns
+
+
+def test_close_mcp_clients():
+    """_close_mcp_clients should close all clients and clear the dict."""
+    class FakeClient:
+        def __init__(self): self.closed = False
+        def close(self): self.closed = True
+    c1, c2 = FakeClient(), FakeClient()
+    clients = {'a': c1, 'b': c2}
+    _close_mcp_clients(clients)
+    assert c1.closed and c2.closed
+    assert len(clients) == 0
+
+
+def test_handle_mcp_list_empty(capsys):
+    """mcp command with no servers should show empty message."""
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("")
+    out = capsys.readouterr().out
+    assert "No MCP servers connected" in out or "solvemcp not installed" in out
+
+
+def test_handle_mcp_connect(capsys, monkeypatch):
+    """mcp connect should connect and report tools."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("connect https://mcp.example.com")
+    out = capsys.readouterr().out
+    assert "Connected to https://mcp.example.com" in out
+    assert "echo" in out
+    assert 'https://mcp.example.com' in ext._mcp_clients
+
+
+def test_handle_mcp_connect_duplicate(capsys, monkeypatch):
+    """mcp connect should reject duplicate connections."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("connect https://mcp.example.com")
+    capsys.readouterr()
+    ext._handle_mcp("connect https://mcp.example.com")
+    out = capsys.readouterr().out
+    assert "Already connected" in out
+
+
+def test_handle_mcp_disconnect(capsys, monkeypatch):
+    """mcp disconnect should close and remove the client."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("connect https://mcp.example.com")
+    capsys.readouterr()
+    ext._handle_mcp("disconnect https://mcp.example.com")
+    out = capsys.readouterr().out
+    assert "Disconnected" in out
+    assert 'https://mcp.example.com' not in ext._mcp_clients
+
+
+def test_handle_mcp_disconnect_unknown(capsys, monkeypatch):
+    """mcp disconnect on unknown server should show error."""
+    _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("disconnect https://nope.com")
+    out = capsys.readouterr().out
+    assert "Not connected" in out
+
+
+def test_handle_mcp_list_connected(capsys, monkeypatch):
+    """mcp with no args should list connected servers."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("connect https://mcp.example.com")
+    capsys.readouterr()
+    ext._handle_mcp("")
+    out = capsys.readouterr().out
+    assert "mcp.example.com" in out
+    assert "echo" in out
+
+
+def test_handle_mcp_no_solvemcp(capsys, monkeypatch):
+    """mcp command should show install hint when solvemcp missing."""
+    import builtins
+    _orig_import = builtins.__import__
+    def _raise(name, *a, **kw):
+        if name == 'solvemcp' or name.startswith('solvemcp.'):
+            raise ImportError("No module named 'solvemcp'")
+        return _orig_import(name, *a, **kw)
+    monkeypatch.delitem(sys.modules, 'solvemcp', raising=False)
+    monkeypatch.setattr(builtins, '__import__', _raise)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("")
+    out = capsys.readouterr().out
+    assert "solvemcp not installed" in out
+
+
+def test_handle_mcp_unknown_subcommand(capsys, monkeypatch):
+    """mcp with unknown subcommand should show error."""
+    _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("bogus")
+    out = capsys.readouterr().out
+    assert "Unknown mcp subcommand" in out
+
+
+def test_handle_line_dispatches_mcp(capsys, monkeypatch):
+    """handle_line should route 'mcp' to _handle_mcp."""
+    _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext.handle_line("mcp")
+    out = capsys.readouterr().out
+    assert "No MCP servers connected" in out or "solvemcp not installed" in out
+
+
+def test_build_sysp_includes_mcp():
+    sp = _build_sysp("base", [])
+    assert "<mcp>" in sp
+    assert "mcp connect" in sp
+
+
+def test_help_includes_mcp(capsys):
+    _,ext = mk_ext(load=False)
+    ext._show_help()
+    out = capsys.readouterr().out
+    assert "mcp" in out
+
+
+def test_status_shows_mcp_count(capsys):
+    """Status output should show MCP server count."""
+    _,ext = mk_ext(load=False)
+    ext.handle_line("")
+    out = capsys.readouterr().out
+    assert "mcp=0 servers connected" in out
+
+
+def test_unload_closes_mcp_clients(monkeypatch):
+    """unload should close all MCP clients."""
+    _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=True)
+    ext._handle_mcp("connect https://mcp.example.com")
+    client = ext._mcp_clients.get('https://mcp.example.com')
+    ext.unload()
+    assert len(ext._mcp_clients) == 0
+    assert client is not None and client.closed
+
+
+def test_connect_mcp_http(monkeypatch):
+    """_connect_mcp should use http for https:// URIs."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    client, tools = _connect_mcp("https://mcp.example.com")
+    assert 'echo' in tools
+    assert callable(tools['echo'])
+
+
+def test_connect_mcp_stdio(monkeypatch):
+    """_connect_mcp should use stdio for non-http URIs."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    client, tools = _connect_mcp("python -m my_server")
+    assert 'echo' in tools

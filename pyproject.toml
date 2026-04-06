@@ -26,6 +26,10 @@ dependencies = [
     "toolslm",
     "mistletoe",
     "pyyaml",
+    "bgterm",
+    "exhash",
+    "bhoga",
+    "solvemcp",
 ]
 
 [project.scripts]
