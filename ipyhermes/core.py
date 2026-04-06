@@ -636,6 +636,46 @@ def _inject_bhoga(ns:dict):
     except ImportError: pass
 
 
+# ── MCP (solvemcp) ───────────────────────────────────────────────────────────
+def _connect_mcp(uri:str):
+    """Connect to an MCP server by URI. Returns (MCPClient, dict_of_callables) or raises."""
+    from solvemcp import MCPClient
+    if uri.startswith(("http://", "https://")):
+        client = MCPClient.http(uri)
+    else:
+        client = MCPClient.stdio(uri.split())
+    tools = {}
+    for name, spec in client.tools.items():
+        fn = getattr(client, name, None)
+        if callable(fn): tools[name] = fn
+    return client, tools
+
+def _inject_mcp(ns:dict, mcp_clients:dict):
+    """Connect to MCP servers from IPYHERMES_MCP env var and inject tools.
+
+    ``mcp_clients`` is mutated: server-URI → MCPClient for lifecycle management.
+    """
+    raw = os.environ.get('IPYHERMES_MCP', '')
+    if not raw: return
+    try:
+        from solvemcp import MCPClient  # noqa: F401 — availability check
+    except ImportError: return
+    for uri in (u.strip() for u in raw.split(',') if u.strip()):
+        try:
+            client, tools = _connect_mcp(uri)
+            mcp_clients[uri] = client
+            for tname, fn in tools.items(): ns.setdefault(tname, fn)
+        except Exception as exc:
+            print(f"[ipyhermes] MCP connect failed for {uri}: {exc}")
+
+def _close_mcp_clients(mcp_clients:dict):
+    "Close all open MCP clients."
+    for client in mcp_clients.values():
+        try: client.close()
+        except Exception: pass
+    mcp_clients.clear()
+
+
 # ── System prompt builder ────────────────────────────────────────────────────
 def _build_sysp(base:str, skills:list, caveman:bool=False) -> str:
     parts = [base]
@@ -667,7 +707,11 @@ Prefer exhash_file over ex/sed for safer multi-line edits.
 </exhash>
 <bhoga>
 bhoga_router is a quota-aware provider router. apply_to_hermes(bhoga_router, model) writes best provider to hermes config.
-</bhoga>""")
+</bhoga>
+<mcp>
+MCP servers can be connected via %ipyhermes mcp connect <url>. Their tools are injected into the namespace and usable with &`tool_name` references.
+Use %ipyhermes mcp to list connected servers. Use %ipyhermes mcp disconnect <url> to close a connection.
+</mcp>""")
     if caveman:
         parts.append("""
 <caveman>
@@ -731,6 +775,9 @@ class HermesExtension:
         _inject_bgterm(ns)
         _inject_exhash(ns)
         _inject_bhoga(ns)
+        # ── MCP servers (solvemcp) ─────────────────────────────────────────
+        self._mcp_clients = {}
+        _inject_mcp(ns, self._mcp_clients)
         try:
             from safecmd import bash, ex, sed
             from pyskills import doc
@@ -1029,6 +1076,7 @@ class HermesExtension:
         if transform_prompt_mode in cts: cts.remove(transform_prompt_mode)
         if self.shell.user_ns.get(EXTENSION_NS) is self: self.shell.user_ns.pop(EXTENSION_NS, None)
         if getattr(self.shell, EXTENSION_ATTR, None) is self: delattr(self.shell, EXTENSION_ATTR)
+        _close_mcp_clients(self._mcp_clients)
         self.loaded = False
         return self
 
@@ -1086,6 +1134,7 @@ class HermesExtension:
             ("caveman",            "Toggle caveman mode (~75% fewer tokens)"),
             ("memory on|off",      "Toggle karma ConversationLog persistence"),
             ("route [auto|<prov>]", "Show quota / auto-route / force provider (bhoga)"),
+            ("mcp [connect|disconnect]", "Manage MCP server connections (solvemcp)"),
             ("save <file>",        "Save session to .ipynb"),
             ("load <file>",        "Load session from .ipynb"),
             ("reset",              "Clear AI prompts from current session"),
@@ -1134,6 +1183,46 @@ class HermesExtension:
                                _make_approval_cb(), session_id=sid)
         return print(f"Provider forced to: {arg}")
 
+    # ── MCP (solvemcp) ────────────────────────────────────────────────────
+    def _handle_mcp(self, arg: str):
+        "Handle %ipyhermes mcp [connect <uri>|disconnect <uri>]."
+        try:
+            from solvemcp import MCPClient  # noqa: F401
+        except ImportError:
+            return print("solvemcp not installed. Install with: pip install solvemcp")
+        if not arg:
+            # List connected MCP servers and their tools
+            if not self._mcp_clients:
+                return print("No MCP servers connected.")
+            for uri, client in self._mcp_clients.items():
+                tool_names = sorted(client.tools.keys()) if hasattr(client, 'tools') else []
+                print(f"  {uri}  tools: {', '.join(tool_names) or '(none)'}")
+            return
+        sub, _, rest = arg.partition(" ")
+        rest = rest.strip()
+        if sub == "connect":
+            if not rest: return print("Usage: %ipyhermes mcp connect <url-or-command>")
+            if rest in self._mcp_clients:
+                return print(f"Already connected to {rest}")
+            try:
+                client, tools = _connect_mcp(rest)
+            except Exception as exc:
+                return print(f"MCP connect failed: {exc}")
+            self._mcp_clients[rest] = client
+            ns = self.shell.user_ns
+            for tname, fn in tools.items(): ns.setdefault(tname, fn)
+            print(f"Connected to {rest} — tools: {', '.join(sorted(tools)) or '(none)'}")
+            return
+        if sub == "disconnect":
+            if not rest: return print("Usage: %ipyhermes mcp disconnect <url-or-command>")
+            client = self._mcp_clients.pop(rest, None)
+            if client is None:
+                return print(f"Not connected to {rest}")
+            try: client.close()
+            except Exception: pass
+            return print(f"Disconnected from {rest}")
+        return print(f"Unknown mcp subcommand: {sub!r}. Use: mcp, mcp connect <uri>, mcp disconnect <uri>")
+
     # ── handle_line (magic dispatcher) ─────────────────────────────────────
     def handle_line(self, line: str):
         line = line.strip()
@@ -1141,6 +1230,8 @@ class HermesExtension:
             for o in _STATUS_ATTRS: self._show(o)
             self._show("caveman")
             print(f"memory={'on' if self._convlog is not None else 'off'}")
+            n_mcp = len(self._mcp_clients)
+            print(f"mcp={n_mcp} server{'s' if n_mcp != 1 else ''} connected")
             print(f"{CONFIG_PATH=}")
             print(f"{SYSP_PATH=}")
             return print(f"{LOG_PATH=}")
@@ -1174,6 +1265,8 @@ class HermesExtension:
                 return print(f"memory={'on' if self._convlog is not None else 'off'}")
         if cmd == "route":
             return self._handle_route(clean)
+        if cmd == "mcp":
+            return self._handle_mcp(clean)
         if cmd == "save":
             if not clean: return print("Usage: %ipyhermes save <filename>")
             path, ncode, nprompt = self.save_notebook(clean)

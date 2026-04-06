@@ -119,6 +119,9 @@ Notes appear in the AI context as `<note>` blocks rather than `<code>` blocks. W
 %ipyhermes memory on
 %ipyhermes route
 %ipyhermes route auto
+%ipyhermes mcp
+%ipyhermes mcp connect https://mcp.example.com
+%ipyhermes mcp disconnect https://mcp.example.com
 ```
 
 - `%ipyhermes` — show current settings and config file paths
@@ -134,6 +137,9 @@ Notes appear in the AI context as `<note>` blocks rather than `<code>` blocks. W
 - `%ipyhermes route` — show provider quota status (requires bhoga)
 - `%ipyhermes route auto` — auto-select best provider based on quota (requires bhoga)
 - `%ipyhermes route <provider>` — force a specific provider
+- `%ipyhermes mcp` — list connected MCP servers and their tools (requires solvemcp)
+- `%ipyhermes mcp connect <url>` — connect to an MCP server (HTTP or stdio) and inject its tools
+- `%ipyhermes mcp disconnect <url>` — disconnect from an MCP server
 - `%ipyhermes help` — show command reference
 
 ## Tools
@@ -271,8 +277,33 @@ On load, `ipyhermes` injects these into the IPython namespace (when available):
 - **bgterm**: `start_bgterm`, `write_stdin`, `close_bgterm` — persistent background shell sessions for multi-step workflows
 - **exhash**: `lnhashview_file`, `exhash_file` — hash-addressed file editing immune to line number drift
 - **bhoga**: `bhoga_router`, `apply_to_hermes` — quota-aware provider routing
+- **solvemcp**: MCP server tools — dynamically injected from connected MCP servers
 - **safecmd**: `bash`, `ex`, `sed`
 - **pyskills**: `doc`
+
+## MCP Server Integration
+
+`ipyhermes` can connect to [MCP](https://modelcontextprotocol.io/) servers via [solvemcp](https://github.com/AnswerDotAI/solvemcp). Tools from connected servers are injected into the IPython namespace and usable with `` &`tool_name` `` backtick references.
+
+### Auto-connect on startup
+
+Set the `IPYHERMES_MCP` environment variable to a comma-separated list of server URIs:
+
+```bash
+export IPYHERMES_MCP="https://mcp.grep.app,python -m my_local_server"
+```
+
+HTTP(S) URIs use Streamable HTTP transport; other values are treated as stdio commands.
+
+### Interactive management
+
+```python
+%ipyhermes mcp                                    # list connected servers
+%ipyhermes mcp connect https://mcp.grep.app       # connect to a server
+%ipyhermes mcp disconnect https://mcp.grep.app    # disconnect
+```
+
+Connected servers are closed on `%reload_ext ipyhermes` or IPython exit.
 
 ## Karma ConversationLog (Always-On)
 

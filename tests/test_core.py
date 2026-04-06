@@ -15,7 +15,8 @@ from ipyhermes.core import (EXTENSION_NS, LAST_PROMPT, LAST_RESPONSE, RESET_LINE
     _shell_names, _shell_refs, _run_shell_refs,
     transform_prompt_mode,
     _discover_skills, _skills_xml, _build_sysp, _strip_thinking, _extract_code_blocks, _eval_code_blocks, load_skill,
-    _git_repo_root, _list_sessions, resume_session, _hermes_session_id, _mk_convlog)
+    _git_repo_root, _list_sessions, resume_session, _hermes_session_id, _mk_convlog,
+    _inject_mcp, _connect_mcp, _close_mcp_clients)
 
 
 # ── Test doubles ─────────────────────────────────────────────────────────────
@@ -1348,3 +1349,264 @@ def test_status_shows_memory_state(capsys, monkeypatch):
     ext.handle_line("")
     out = capsys.readouterr().out
     assert "memory=on" in out
+
+
+# ── Tests: MCP (solvemcp) ───────────────────────────────────────────────────
+
+def _fake_solvemcp(monkeypatch):
+    """Set up a fake solvemcp module with a mock MCPClient."""
+    import types
+    fake_mod = types.ModuleType('solvemcp')
+
+    class FakeMCPClient:
+        _instances = []
+
+        def __init__(self, uri=None):
+            self.uri = uri
+            self.tools = {'echo': types.SimpleNamespace(name='echo')}
+            self.closed = False
+            type(self)._instances.append(self)
+
+        def echo(self, text=""): return {'content': [{'type': 'text', 'text': text}]}
+
+        def close(self): self.closed = True
+
+        @classmethod
+        def http(cls, url, **kw):
+            c = cls(uri=url)
+            setattr(c, 'echo', c.echo)
+            return c
+
+        @classmethod
+        def stdio(cls, cmd, **kw):
+            c = cls(uri=' '.join(cmd) if isinstance(cmd, list) else cmd)
+            setattr(c, 'echo', c.echo)
+            return c
+
+    fake_mod.MCPClient = FakeMCPClient
+    monkeypatch.setitem(sys.modules, 'solvemcp', fake_mod)
+    return FakeMCPClient
+
+
+def test_inject_mcp_connects_from_env(monkeypatch):
+    """_inject_mcp should connect to servers from IPYHERMES_MCP env var."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    monkeypatch.setenv('IPYHERMES_MCP', 'https://mcp.example.com')
+
+    ns = {}
+    clients = {}
+    _inject_mcp(ns, clients)
+    assert 'https://mcp.example.com' in clients
+    assert 'echo' in ns
+    assert callable(ns['echo'])
+
+
+def test_inject_mcp_multiple_servers(monkeypatch):
+    """_inject_mcp should connect to multiple comma-separated servers."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    monkeypatch.setenv('IPYHERMES_MCP', 'https://a.com, https://b.com')
+
+    ns = {}
+    clients = {}
+    _inject_mcp(ns, clients)
+    assert len(clients) == 2
+    assert 'https://a.com' in clients
+    assert 'https://b.com' in clients
+
+
+def test_inject_mcp_noop_when_missing(monkeypatch):
+    """_inject_mcp should silently skip when solvemcp not installed."""
+    import builtins
+    _orig_import = builtins.__import__
+    def _raise_for_solvemcp(name, *a, **kw):
+        if name == 'solvemcp' or name.startswith('solvemcp.'):
+            raise ImportError(f"No module named '{name}'")
+        return _orig_import(name, *a, **kw)
+    monkeypatch.delitem(sys.modules, 'solvemcp', raising=False)
+    monkeypatch.setattr(builtins, '__import__', _raise_for_solvemcp)
+    monkeypatch.setenv('IPYHERMES_MCP', 'https://mcp.example.com')
+
+    ns = {}
+    clients = {}
+    _inject_mcp(ns, clients)
+    assert len(clients) == 0
+    assert 'echo' not in ns
+
+
+def test_inject_mcp_noop_when_no_env(monkeypatch):
+    """_inject_mcp should do nothing when IPYHERMES_MCP is not set."""
+    _fake_solvemcp(monkeypatch)
+    monkeypatch.delenv('IPYHERMES_MCP', raising=False)
+
+    ns = {}
+    clients = {}
+    _inject_mcp(ns, clients)
+    assert len(clients) == 0
+
+
+def test_inject_mcp_stdio_fallback(monkeypatch):
+    """_inject_mcp should use stdio for non-http URIs."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    monkeypatch.setenv('IPYHERMES_MCP', 'python -m my_server')
+
+    ns = {}
+    clients = {}
+    _inject_mcp(ns, clients)
+    assert 'python -m my_server' in clients
+    assert 'echo' in ns
+
+
+def test_close_mcp_clients():
+    """_close_mcp_clients should close all clients and clear the dict."""
+    class FakeClient:
+        def __init__(self): self.closed = False
+        def close(self): self.closed = True
+    c1, c2 = FakeClient(), FakeClient()
+    clients = {'a': c1, 'b': c2}
+    _close_mcp_clients(clients)
+    assert c1.closed and c2.closed
+    assert len(clients) == 0
+
+
+def test_handle_mcp_list_empty(capsys):
+    """mcp command with no servers should show empty message."""
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("")
+    out = capsys.readouterr().out
+    assert "No MCP servers connected" in out or "solvemcp not installed" in out
+
+
+def test_handle_mcp_connect(capsys, monkeypatch):
+    """mcp connect should connect and report tools."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("connect https://mcp.example.com")
+    out = capsys.readouterr().out
+    assert "Connected to https://mcp.example.com" in out
+    assert "echo" in out
+    assert 'https://mcp.example.com' in ext._mcp_clients
+
+
+def test_handle_mcp_connect_duplicate(capsys, monkeypatch):
+    """mcp connect should reject duplicate connections."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("connect https://mcp.example.com")
+    capsys.readouterr()
+    ext._handle_mcp("connect https://mcp.example.com")
+    out = capsys.readouterr().out
+    assert "Already connected" in out
+
+
+def test_handle_mcp_disconnect(capsys, monkeypatch):
+    """mcp disconnect should close and remove the client."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("connect https://mcp.example.com")
+    capsys.readouterr()
+    ext._handle_mcp("disconnect https://mcp.example.com")
+    out = capsys.readouterr().out
+    assert "Disconnected" in out
+    assert 'https://mcp.example.com' not in ext._mcp_clients
+
+
+def test_handle_mcp_disconnect_unknown(capsys, monkeypatch):
+    """mcp disconnect on unknown server should show error."""
+    _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("disconnect https://nope.com")
+    out = capsys.readouterr().out
+    assert "Not connected" in out
+
+
+def test_handle_mcp_list_connected(capsys, monkeypatch):
+    """mcp with no args should list connected servers."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("connect https://mcp.example.com")
+    capsys.readouterr()
+    ext._handle_mcp("")
+    out = capsys.readouterr().out
+    assert "mcp.example.com" in out
+    assert "echo" in out
+
+
+def test_handle_mcp_no_solvemcp(capsys, monkeypatch):
+    """mcp command should show install hint when solvemcp missing."""
+    import builtins
+    _orig_import = builtins.__import__
+    def _raise(name, *a, **kw):
+        if name == 'solvemcp' or name.startswith('solvemcp.'):
+            raise ImportError("No module named 'solvemcp'")
+        return _orig_import(name, *a, **kw)
+    monkeypatch.delitem(sys.modules, 'solvemcp', raising=False)
+    monkeypatch.setattr(builtins, '__import__', _raise)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("")
+    out = capsys.readouterr().out
+    assert "solvemcp not installed" in out
+
+
+def test_handle_mcp_unknown_subcommand(capsys, monkeypatch):
+    """mcp with unknown subcommand should show error."""
+    _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("bogus")
+    out = capsys.readouterr().out
+    assert "Unknown mcp subcommand" in out
+
+
+def test_handle_line_dispatches_mcp(capsys, monkeypatch):
+    """handle_line should route 'mcp' to _handle_mcp."""
+    _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=False)
+    ext.handle_line("mcp")
+    out = capsys.readouterr().out
+    assert "No MCP servers connected" in out or "solvemcp not installed" in out
+
+
+def test_build_sysp_includes_mcp():
+    sp = _build_sysp("base", [])
+    assert "<mcp>" in sp
+    assert "mcp connect" in sp
+
+
+def test_help_includes_mcp(capsys):
+    _,ext = mk_ext(load=False)
+    ext._show_help()
+    out = capsys.readouterr().out
+    assert "mcp" in out
+
+
+def test_status_shows_mcp_count(capsys):
+    """Status output should show MCP server count."""
+    _,ext = mk_ext(load=False)
+    ext.handle_line("")
+    out = capsys.readouterr().out
+    assert "mcp=0 servers connected" in out
+
+
+def test_unload_closes_mcp_clients(monkeypatch):
+    """unload should close all MCP clients."""
+    _fake_solvemcp(monkeypatch)
+    _,ext = mk_ext(load=True)
+    ext._handle_mcp("connect https://mcp.example.com")
+    client = ext._mcp_clients.get('https://mcp.example.com')
+    ext.unload()
+    assert len(ext._mcp_clients) == 0
+    assert client is not None and client.closed
+
+
+def test_connect_mcp_http(monkeypatch):
+    """_connect_mcp should use http for https:// URIs."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    client, tools = _connect_mcp("https://mcp.example.com")
+    assert 'echo' in tools
+    assert callable(tools['echo'])
+
+
+def test_connect_mcp_stdio(monkeypatch):
+    """_connect_mcp should use stdio for non-http URIs."""
+    FakeMCPClient = _fake_solvemcp(monkeypatch)
+    client, tools = _connect_mcp("python -m my_server")
+    assert 'echo' in tools

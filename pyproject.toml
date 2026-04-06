@@ -29,6 +29,7 @@ dependencies = [
     "bgterm",
     "exhash",
     "bhoga",
+    "solvemcp",
 ]
 
 [project.scripts]
