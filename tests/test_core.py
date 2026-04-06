@@ -15,7 +15,7 @@ from ipyhermes.core import (EXTENSION_NS, LAST_PROMPT, LAST_RESPONSE, RESET_LINE
     _shell_names, _shell_refs, _run_shell_refs,
     transform_prompt_mode,
     _discover_skills, _skills_xml, _build_sysp, _strip_thinking, _extract_code_blocks, _eval_code_blocks, load_skill,
-    _git_repo_root, _list_sessions, resume_session)
+    _git_repo_root, _list_sessions, resume_session, _hermes_session_id, _mk_convlog)
 
 
 # ── Test doubles ─────────────────────────────────────────────────────────────
@@ -274,7 +274,7 @@ async def test_extension_load_is_idempotent_and_tracks_last_response(dummy_agent
     assert shell.user_ns[LAST_PROMPT] == "tell me something"
     assert shell.user_ns[LAST_RESPONSE] == "first second"
     assert ext.prompt_rows() == [("tell me something", "first second")]
-    assert ext.prompt_records()[0][3] == 1
+    assert ext.prompt_records()[0]['history_line'] == 1
 
 
 async def test_run_prompt_suppresses_ipython_output_history_while_streaming(monkeypatch, dummy_agent):
@@ -304,22 +304,6 @@ async def test_run_prompt_stores_cleaned_response_for_output_history(monkeypatch
     await ext.run_prompt("test")
 
     assert ng._pty_output == "Hello world"
-
-
-def test_unexpected_prompt_table_schema_is_recreated():
-    shell = DummyShell()
-    with shell.history_manager.db:
-        shell.history_manager.db.execute("CREATE TABLE ai_prompts (id INTEGER PRIMARY KEY AUTOINCREMENT, session INTEGER NOT NULL, "
-            "prompt TEXT NOT NULL, response TEXT NOT NULL, history_line INTEGER NOT NULL DEFAULT 0, "
-            "prompt_line INTEGER NOT NULL DEFAULT 0)")
-        shell.history_manager.db.execute("INSERT INTO ai_prompts (session, prompt, response, history_line, prompt_line) VALUES "
-            "(1, 'p', 'r', 1, 2)")
-
-    ext = HermesExtension(shell=shell)
-
-    assert ext.prompt_records() == []
-    cols = [o[1] for o in shell.history_manager.db.execute("PRAGMA table_info(ai_prompts)")]
-    assert cols == ["id", "session", "prompt", "response", "history_line"]
 
 
 def test_config_file_is_created_and_loaded():
@@ -387,7 +371,7 @@ def test_handle_line_can_report_and_set_model(capsys):
 
 # ── Tests: Dialog History ────────────────────────────────────────────────────
 
-async def test_second_prompt_uses_sqlite_prompt_history(dummy_agent):
+async def test_second_prompt_uses_in_memory_prompt_history(dummy_agent):
     shell,ext = mk_ext()
 
     await ext.run_prompt("first prompt")
@@ -434,20 +418,17 @@ async def test_second_prompt_replays_prior_context_in_chat_history(dummy_agent):
     assert "<code>print('a')</code>" in first_call["prompt"]
 
 
-def test_reset_only_deletes_current_session_history(capsys):
+def test_reset_clears_in_memory_prompts(capsys):
     shell,ext = mk_ext()
 
-    ext.save_prompt("s1 prompt", "s1 response", 1)
-    shell.history_manager.session_number = 2
-    shell.execution_count = 8
-    ext.save_prompt("s2 prompt", "s2 response", 7)
+    ext.save_prompt("p1", "r1", 1)
+    ext.save_prompt("p2", "r2", 7)
 
     ext.handle_line("reset")
 
-    assert capsys.readouterr().out == "Deleted 1 AI prompts from session 2.\n"
-    assert ext.prompt_rows(session=1) == [("s1 prompt", "s1 response")]
-    assert ext.prompt_rows(session=2) == []
-    assert shell.user_ns[RESET_LINE_NS] == 7
+    assert capsys.readouterr().out == "Deleted 2 AI prompts from session 1.\n"
+    assert ext.prompt_rows() == []
+    assert shell.user_ns[RESET_LINE_NS] == 1  # current_prompt_line() = execution_count - 1 = 2 - 1 = 1
 
 
 # ── Tests: Context XML ───────────────────────────────────────────────────────
@@ -536,7 +517,7 @@ def test_load_notebook_replays_code_and_restores_prompts(tmp_path):
 
     assert shell.ran_cells == [("import math", True), ("x = 1", True)]
     assert ext.prompt_rows() == [("hi", "hello")]
-    assert ext.prompt_records()[0][3] == 2
+    assert ext.prompt_records()[0]['history_line'] == 2
     assert ext.dialog_history()[0][0] == "<context><code>import math</code></context>\n<user-request>hi</user-request>"
     assert shell.execution_count == 4
 
@@ -912,11 +893,10 @@ def test_sysprompt_mentions_variables_and_shell():
 # ── Tests: Session Persistence ───────────────────────────────────────────────
 
 def _mk_sessions_db():
-    "Create an in-memory DB with the IPython sessions, history, and ai_prompts tables."
+    "Create an in-memory DB with the IPython sessions and history tables."
     db = sqlite3.connect(":memory:")
     db.execute("CREATE TABLE sessions (session INTEGER PRIMARY KEY AUTOINCREMENT, start TEXT, end TEXT, num_cmds INTEGER, remark TEXT)")
     db.execute("CREATE TABLE history (session INTEGER, line INTEGER, source TEXT, source_raw TEXT)")
-    db.execute("CREATE TABLE ai_prompts (id INTEGER PRIMARY KEY AUTOINCREMENT, session INTEGER, prompt TEXT, response TEXT, history_line INTEGER)")
     return db
 
 def test_git_repo_root(tmp_path):
@@ -936,13 +916,12 @@ def test_list_sessions_exact_match():
     assert len(rows) == 1
     assert rows[0][0] == 1
 
-def test_list_sessions_with_prompts():
+def test_list_sessions_returns_matching_rows():
     db = _mk_sessions_db()
     db.execute("INSERT INTO sessions VALUES (1, '2025-01-01', NULL, 5, '/proj')")
-    db.execute("INSERT INTO ai_prompts (session, prompt, response, history_line) VALUES (1, 'first', 'r1', 0)")
-    db.execute("INSERT INTO ai_prompts (session, prompt, response, history_line) VALUES (1, 'second', 'r2', 1)")
     rows = _list_sessions(db, "/proj")
-    assert rows[0][5] == "second"
+    assert len(rows) == 1
+    assert rows[0][0] == 1
 
 def test_list_sessions_git_fallback(tmp_path):
     (tmp_path / ".git").mkdir()
@@ -987,9 +966,7 @@ def test_handle_line_sessions(dummy_agent):
     shell,ext = mk_ext()
     hm = shell.history_manager
     hm.db.execute("CREATE TABLE IF NOT EXISTS sessions (session INTEGER PRIMARY KEY, start TEXT, end TEXT, num_cmds INTEGER, remark TEXT)")
-    hm.db.execute("CREATE TABLE IF NOT EXISTS ai_prompts (id INTEGER PRIMARY KEY AUTOINCREMENT, session INTEGER NOT NULL, prompt TEXT NOT NULL, response TEXT NOT NULL, history_line INTEGER NOT NULL DEFAULT 0)")
     hm.db.execute("INSERT INTO sessions VALUES (1, '2025-01-01', NULL, 5, ?)", (os.getcwd(),))
-    hm.db.execute("INSERT INTO ai_prompts (session, prompt, response, history_line) VALUES (1, 'hello world', 'hi', 0)")
     import io as _io
     buf = _io.StringIO()
     import sys as _sys
@@ -999,7 +976,60 @@ def test_handle_line_sessions(dummy_agent):
     finally: _sys.stdout = old
     out = buf.getvalue()
     assert "1" in out
-    assert "hello world" in out
+
+
+# ── Tests: Hermes Session ID Bridge ──────────────────────────────────────────
+
+def test_hermes_session_id_format():
+    assert _hermes_session_id(1) == "ipyhermes-1"
+    assert _hermes_session_id(42) == "ipyhermes-42"
+    assert _hermes_session_id(0) == "ipyhermes-0"
+
+
+def test_agents_receive_session_id(monkeypatch):
+    """All three agents should be created with a session_id derived from the IPython session number."""
+    created = []
+    class TrackingAgent:
+        def __init__(self, **kw):
+            self.kw = kw
+            created.append(kw)
+        async def astream(self, prompt, sp=None, hist=None):
+            yield ""
+    monkeypatch.setattr(core, "_mk_agent", lambda *a, **kw: TrackingAgent(**kw))
+    shell = DummyShell()
+    shell.history_manager.session_number = 7
+    ext = HermesExtension(shell=shell)
+    assert len(created) == 3
+    for agent_kw in created:
+        assert agent_kw.get("session_id") == "ipyhermes-7"
+
+
+def test_hot_swap_preserves_session_id(monkeypatch, capsys):
+    """Agent hot-swap on model change should pass the current session_id."""
+    created = []
+    class TrackingAgent:
+        def __init__(self, **kw):
+            self.kw = kw
+            created.append(kw)
+        async def astream(self, prompt, sp=None, hist=None):
+            yield ""
+    monkeypatch.setattr(core, "_mk_agent", lambda *a, **kw: TrackingAgent(**kw))
+    shell = DummyShell()
+    shell.history_manager.session_number = 3
+    ext = HermesExtension(shell=shell)
+    ext.load()
+    created.clear()
+    ext.handle_line("model gpt-4o")
+    assert len(created) == 1
+    assert created[0].get("session_id") == "ipyhermes-3"
+
+
+def test_reset_clears_prompts():
+    """reset_session_history should clear the in-memory _prompts list."""
+    shell, ext = mk_ext()
+    ext._prompts = [dict(prompt="hi", response="hello", history_line=1)]
+    ext.reset_session_history()
+    assert ext._prompts == []
 
 
 # ── Tests: Handle Line Commands ──────────────────────────────────────────────
@@ -1013,15 +1043,19 @@ def test_handle_line_help(capsys):
     assert "load" in out
     assert "reset" in out
     assert "sessions" in out
-    assert "clear-history" in out
+    assert "memory" in out
 
 
-def test_handle_line_clear_history(capsys):
+def test_handle_line_memory(capsys, monkeypatch):
+    monkeypatch.setattr(core, "_mk_convlog", lambda sid: None)  # karma not installed
     _,ext = mk_ext(load=False)
-    ext._hist = [dict(role="user", content="hi"), dict(role="assistant", content="hello")]
-    ext.handle_line("clear-history")
-    assert ext._hist == []
-    assert "cleared" in capsys.readouterr().out
+    ext.handle_line("memory on")
+    out = capsys.readouterr().out
+    assert "in-memory only" in out
+    ext.handle_line("memory off")
+    assert "Memory off" in capsys.readouterr().out
+    ext.handle_line("memory")
+    assert "memory=off" in capsys.readouterr().out
 
 
 def test_handle_line_unknown(capsys):
