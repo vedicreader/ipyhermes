@@ -109,10 +109,11 @@ Notes appear in the AI context as `<note>` blocks rather than `<code>` blocks. W
 %ipyhermes search h
 %ipyhermes code_theme monokai
 %ipyhermes log_exact true
+%ipyhermes caveman
+%ipyhermes memory on|off
 %ipyhermes save mysession
 %ipyhermes load mysession
 %ipyhermes reset
-%ipyhermes clear-history
 %ipyhermes sessions
 %ipyhermes help
 %ipyhermes prompt
@@ -123,8 +124,9 @@ Notes appear in the AI context as `<note>` blocks rather than `<code>` blocks. W
 - `%ipyhermes think ...` / `search ...` / `code_theme ...` / `log_exact ...` — change settings
 - `%ipyhermes save <file>` — save the current session to a `.ipynb` notebook
 - `%ipyhermes load <file>` — restore a session from a notebook
+- `%ipyhermes caveman` — toggle caveman mode (~75% fewer tokens)
+- `%ipyhermes memory on|off` — toggle karma ConversationLog integration
 - `%ipyhermes reset` — clear AI prompt history for the current session
-- `%ipyhermes clear-history` — clear the hermes multi-turn conversation history
 - `%ipyhermes sessions` — list resumable sessions for the current directory
 - `%ipyhermes prompt` — toggle prompt mode (all input → AI, `;` escapes to Python)
 - `%ipyhermes help` — show command reference
@@ -211,6 +213,7 @@ def my_tool(x):
 | `ipyhermes-help` | Help and docs for ipyhermes |
 | `ipython-unicode` | Unicode symbol insertion via LaTeX names |
 | `sed` | Stream editing tool |
+| `caveman` | Caveman mode for terse ~75% fewer token responses |
 
 ### Hermes Skills
 
@@ -286,7 +289,8 @@ Config files live under `~/.config/ipyhermes/` and are created on demand:
   "search": "l",
   "code_theme": "monokai",
   "log_exact": false,
-  "prompt_mode": false
+  "prompt_mode": false,
+  "caveman": false
 }
 ```
 
