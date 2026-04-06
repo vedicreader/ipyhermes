@@ -26,10 +26,14 @@ dependencies = [
     "toolslm",
     "mistletoe",
     "pyyaml",
+    "bgterm",
+    "exhash",
+    "bhoga",
 ]
 
 [project.scripts]
 ipyhermes = "ipyhermes.cli:run"
+ipyhermes-mcp = "ipyhermes.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["ipyhermes*"]

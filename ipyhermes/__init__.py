@@ -40,10 +40,12 @@ try: import karma
 except ImportError: pass
 try: import webba
 except ImportError: pass
+try: import bhoga
+except ImportError: pass
 
 try:
     from .core import (EXTENSION_ATTR, EXTENSION_NS, LAST_PROMPT, LAST_RESPONSE, MAGIC_NAME,
-        PROMPTS_TABLE, RESET_LINE_NS, HermesExtension, create_extension,
+        RESET_LINE_NS, HermesExtension, create_extension,
         load_ipython_extension, unload_ipython_extension)
 except ImportError:
     pass  # some dependencies may not be installed

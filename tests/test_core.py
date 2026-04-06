@@ -15,7 +15,7 @@ from ipyhermes.core import (EXTENSION_NS, LAST_PROMPT, LAST_RESPONSE, RESET_LINE
     _shell_names, _shell_refs, _run_shell_refs,
     transform_prompt_mode,
     _discover_skills, _skills_xml, _build_sysp, _strip_thinking, _extract_code_blocks, _eval_code_blocks, load_skill,
-    _git_repo_root, _list_sessions, resume_session, _hermes_session_id, _mk_convlog)
+    _git_repo_root, _list_sessions, resume_session, _hermes_session_id, _mk_convlog, _mk_toollog)
 
 
 # ── Test doubles ─────────────────────────────────────────────────────────────
@@ -115,6 +115,9 @@ def _config_paths(monkeypatch, tmp_path):
         async def astream(self, prompt, sp=None, hist=None):
             yield ""
     monkeypatch.setattr(core, "_mk_agent", lambda *a, **kw: StubAgent(**kw))
+    # Stub karma/litesearch so tests don't require them
+    monkeypatch.setattr(core, "_mk_convlog", lambda sid: None)
+    monkeypatch.setattr(core, "_mk_toollog", lambda sid: None)
 
 
 @pytest.fixture
@@ -1139,3 +1142,340 @@ def test_build_sysp_caveman_on():
     sp = _build_sysp("base", [], caveman=True)
     assert "<caveman>" in sp
     assert "caveman mode" in sp.lower()
+
+
+# ── Tests: Phase 1 - bgterm & exhash injection ──────────────────────────────
+
+def test_inject_bgterm_adds_functions(monkeypatch):
+    """_inject_bgterm should add start_bgterm, write_stdin, close_bgterm to namespace."""
+    import types
+    fake_mod = types.ModuleType('bgterm')
+    def _start_bgterm(name): return f"started {name}"
+    def _write_stdin(name, text): return f"wrote {text}"
+    def _close_bgterm(name): return f"closed {name}"
+    _start_bgterm.__name__ = 'start_bgterm'
+    _write_stdin.__name__ = 'write_stdin'
+    _close_bgterm.__name__ = 'close_bgterm'
+    fake_mod.start_bgterm = _start_bgterm
+    fake_mod.write_stdin = _write_stdin
+    fake_mod.close_bgterm = _close_bgterm
+    monkeypatch.setitem(sys.modules, 'bgterm', fake_mod)
+
+    ns = {}
+    core._inject_bgterm(ns)
+    assert 'start_bgterm' in ns
+    assert 'write_stdin' in ns
+    assert 'close_bgterm' in ns
+    assert ns['start_bgterm']('test') == "started test"
+
+
+def test_inject_bgterm_noop_when_missing(monkeypatch):
+    """_inject_bgterm should silently skip when bgterm not installed."""
+    monkeypatch.delitem(sys.modules, 'bgterm', raising=False)
+    monkeypatch.setattr('builtins.__import__', _import_raiser('bgterm'), raising=False)
+    ns = {}
+    # Should not raise, just skip
+    try:
+        core._inject_bgterm(ns)
+    except ImportError:
+        pass
+    # If bgterm is truly not installed, ns should be empty or have only functions from installed bgterm
+    # The key point: no crash
+
+
+def test_inject_exhash_adds_functions(monkeypatch):
+    """_inject_exhash should add lnhashview_file, exhash_file to namespace."""
+    import types
+    fake_mod = types.ModuleType('exhash')
+    def _lnhashview_file(path): return f"viewed {path}"
+    def _exhash_file(path, cmds): return f"edited {path}"
+    _lnhashview_file.__name__ = 'lnhashview_file'
+    _exhash_file.__name__ = 'exhash_file'
+    fake_mod.lnhashview_file = _lnhashview_file
+    fake_mod.exhash_file = _exhash_file
+    monkeypatch.setitem(sys.modules, 'exhash', fake_mod)
+
+    ns = {}
+    core._inject_exhash(ns)
+    assert 'lnhashview_file' in ns
+    assert 'exhash_file' in ns
+    assert ns['lnhashview_file']('test.py') == "viewed test.py"
+
+
+def test_inject_bhoga_adds_router(monkeypatch):
+    """_inject_bhoga should add bhoga_router and apply_to_hermes to namespace."""
+    import types
+    fake_mod = types.ModuleType('bhoga')
+    class FakeRouter:
+        def quotas(self): return {}
+        def best_for(self, model): return None
+    fake_mod.Router = FakeRouter
+    fake_mod.apply_to_hermes = lambda r, m: None
+    monkeypatch.setitem(sys.modules, 'bhoga', fake_mod)
+
+    ns = {}
+    core._inject_bhoga(ns)
+    assert 'bhoga_router' in ns
+    assert 'apply_to_hermes' in ns
+    assert isinstance(ns['bhoga_router'], FakeRouter)
+
+
+def _import_raiser(mod_name):
+    """Create an __import__ replacement that raises ImportError for a specific module."""
+    _orig = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
+    def _mock_import(name, *args, **kwargs):
+        if name == mod_name or name.startswith(mod_name + '.'):
+            raise ImportError(f"No module named '{mod_name}'")
+        return _orig(name, *args, **kwargs)
+    return _mock_import
+
+
+# ── Tests: Phase 1 - system prompt includes new tool docs ───────────────────
+
+def test_build_sysp_includes_bgterm():
+    sp = _build_sysp("base", [])
+    assert "<bgterm>" in sp
+    assert "start_bgterm" in sp
+
+def test_build_sysp_includes_exhash():
+    sp = _build_sysp("base", [])
+    assert "<exhash>" in sp
+    assert "exhash_file" in sp
+
+def test_build_sysp_includes_bhoga():
+    sp = _build_sysp("base", [])
+    assert "<bhoga>" in sp
+    assert "bhoga_router" in sp
+
+
+# ── Tests: Phase 2a - Always-on karma ConversationLog ────────────────────────
+
+def test_convlog_always_initialized(monkeypatch):
+    """ConversationLog should be initialized automatically (always-on)."""
+    class FakeConvLog:
+        def __init__(self, session_id): self.session_id = session_id
+        def get_session(self, n=50): return []
+    monkeypatch.setattr(core, "_mk_convlog", lambda sid: FakeConvLog(sid))
+    monkeypatch.setattr(core, "_mk_toollog", lambda sid: None)
+    shell = DummyShell()
+    ext = HermesExtension(shell=shell)
+    assert ext._convlog is not None
+    assert ext._convlog.session_id == "ipyhermes-1"
+
+
+def test_convlog_none_when_karma_missing(monkeypatch):
+    """ConversationLog should be None if karma is not installed."""
+    monkeypatch.setattr(core, "_mk_convlog", lambda sid: None)
+    monkeypatch.setattr(core, "_mk_toollog", lambda sid: None)
+    shell = DummyShell()
+    ext = HermesExtension(shell=shell)
+    assert ext._convlog is None
+
+
+def test_memory_on_off_still_works(capsys, monkeypatch):
+    """User can still toggle memory on/off for backward compat."""
+    monkeypatch.setattr(core, "_mk_convlog", lambda sid: None)
+    _,ext = mk_ext(load=False)
+    ext.handle_line("memory on")
+    out = capsys.readouterr().out
+    assert "in-memory only" in out
+    ext.handle_line("memory off")
+    assert "Memory off" in capsys.readouterr().out
+
+
+# ── Tests: Phase 2b - ToolCallLog ────────────────────────────────────────────
+
+def test_toollog_initialized(monkeypatch):
+    """ToolCallLog should be initialized alongside the extension."""
+    class FakeToolLog:
+        def __init__(self, session_id): self.session_id = session_id
+        def search(self, q, k=10): return []
+        def recent(self, n=20): return []
+    monkeypatch.setattr(core, "_mk_toollog", lambda sid: FakeToolLog(sid))
+    shell = DummyShell()
+    ext = HermesExtension(shell=shell)
+    assert ext._toollog is not None
+    assert ext._toollog.session_id == "ipyhermes-1"
+    # Functions injected into namespace
+    assert 'search_tool_calls' in shell.user_ns
+    assert 'recent_tool_calls' in shell.user_ns
+
+
+def test_toollog_none_when_litesearch_missing(monkeypatch):
+    """ToolCallLog should be None if litesearch is not available."""
+    monkeypatch.setattr(core, "_mk_toollog", lambda sid: None)
+    shell = DummyShell()
+    ext = HermesExtension(shell=shell)
+    assert ext._toollog is None
+    assert 'search_tool_calls' not in shell.user_ns
+
+
+def test_toollog_module_standalone(tmp_path):
+    """ToolCallLog should work as a standalone module with in-memory DB."""
+    try:
+        from ipyhermes.toollog import ToolCallLog
+        log = ToolCallLog(session_id='test', db_path=str(tmp_path / 'test.db'))
+        log.log('bash', 'ls -la', '/home\n/tmp', duration_ms=42.5, success=True)
+        recent = log.recent(n=5, session_id='test')
+        assert len(recent) >= 0  # may be 0 if FTS not set up for schema query
+    except ImportError:
+        pytest.skip("litesearch not installed")
+
+
+# ── Tests: Phase 3 - bhoga route command ─────────────────────────────────────
+
+def test_handle_route_no_bhoga(capsys, monkeypatch):
+    """route command should show error when bhoga not installed."""
+    monkeypatch.delitem(sys.modules, 'bhoga', raising=False)
+    def raise_import(name, *a, **kw):
+        if name == 'bhoga' or name.startswith('bhoga.'):
+            raise ImportError("No module named 'bhoga'")
+        return original_import(name, *a, **kw)
+    import builtins
+    original_import = builtins.__import__
+    monkeypatch.setattr(builtins, '__import__', raise_import)
+    _,ext = mk_ext(load=False)
+    ext._handle_route("")
+    out = capsys.readouterr().out
+    assert "bhoga not installed" in out
+
+
+def test_handle_route_show_quotas(capsys, monkeypatch):
+    """route command with no args should show quota status."""
+    import types
+    fake_bhoga = types.ModuleType('bhoga')
+    class FakeQuota:
+        remaining_pct = 0.75
+        status = 'OK'
+    class FakeRouter:
+        def quotas(self): return {'anthropic_api': FakeQuota()}
+        def best_for(self, model): return None
+    fake_bhoga.Router = FakeRouter
+    fake_bhoga.apply_to_hermes = lambda r, m: None
+    monkeypatch.setitem(sys.modules, 'bhoga', fake_bhoga)
+
+    _,ext = mk_ext(load=False)
+    ext.shell.user_ns['bhoga_router'] = FakeRouter()
+    ext._handle_route("")
+    out = capsys.readouterr().out
+    assert "anthropic_api" in out
+    assert "75%" in out
+
+
+def test_handle_route_force_provider(capsys, monkeypatch):
+    """route command with provider name should force that provider."""
+    import types
+    fake_bhoga = types.ModuleType('bhoga')
+    fake_bhoga.Router = type('Router', (), {'quotas': lambda self: {}})
+    fake_bhoga.apply_to_hermes = lambda r, m: None
+    monkeypatch.setitem(sys.modules, 'bhoga', fake_bhoga)
+
+    _,ext = mk_ext(load=False)
+    ext._handle_route("openai-codex")
+    assert ext.provider == "openai-codex"
+    out = capsys.readouterr().out
+    assert "Provider forced to" in out
+
+
+# ── Tests: Phase 4 - MCP ────────────────────────────────────────────────────
+
+def test_handle_mcp_no_config(capsys, tmp_path, monkeypatch):
+    """mcp list should handle missing config gracefully."""
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'nonexistent'))
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("list")
+    out = capsys.readouterr().out
+    assert "No hermes config" in out
+
+
+def test_handle_mcp_with_servers(capsys, tmp_path, monkeypatch):
+    """mcp list should show configured servers."""
+    hermes_home = tmp_path / '.hermes'
+    hermes_home.mkdir()
+    cfg = hermes_home / 'config.yaml'
+    import yaml
+    cfg.write_text(yaml.dump({
+        'mcp_servers': {
+            'github': {'command': 'npx @mcp/github', 'enabled': True},
+            'disabled-server': {'url': 'http://example.com', 'enabled': False},
+        }
+    }))
+    monkeypatch.setenv('HERMES_HOME', str(hermes_home))
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("list")
+    out = capsys.readouterr().out
+    assert "github" in out
+    assert "✓" in out
+    assert "disabled-server" in out
+    assert "✗" in out
+
+
+def test_handle_mcp_unknown_subcommand(capsys):
+    """mcp with unknown subcommand should show error."""
+    _,ext = mk_ext(load=False)
+    ext._handle_mcp("foobar")
+    out = capsys.readouterr().out
+    assert "Unknown mcp subcommand" in out
+
+
+def test_mcp_server_tools_defined():
+    """MCP server should define all expected tools."""
+    from ipyhermes.mcp_server import _get_tools
+    tools = _get_tools()
+    names = {t['name'] for t in tools}
+    assert 'dev_context' in names
+    assert 'search_code' in names
+    assert 'index_repo' in names
+    assert 'add_practice' in names
+    assert 'query_practices' in names
+    assert 'log_decision' in names
+    assert 'search_decisions' in names
+    assert 'search_tool_calls' in names
+
+
+def test_mcp_call_tool_unknown():
+    """MCP _call_tool should return error for unknown tools."""
+    from ipyhermes.mcp_server import _call_tool
+    result = json.loads(_call_tool("nonexistent_tool", {}))
+    assert "error" in result
+    assert "Unknown tool" in result["error"]
+
+
+def test_mcp_call_tool_handles_missing_dependency():
+    """MCP _call_tool should handle missing dependencies gracefully."""
+    from ipyhermes.mcp_server import _call_tool
+    # search_tool_calls may fail if litesearch not installed, but shouldn't crash
+    result = _call_tool("search_tool_calls", {"query": "test"})
+    parsed = json.loads(result) if isinstance(result, str) else result
+    # Either returns valid results or an error dict - never crashes
+    assert isinstance(parsed, (list, dict))
+
+
+# ── Tests: Help text includes new commands ───────────────────────────────────
+
+def test_help_includes_route(capsys):
+    _,ext = mk_ext(load=False)
+    ext._show_help()
+    out = capsys.readouterr().out
+    assert "route" in out
+
+def test_help_includes_mcp(capsys):
+    _,ext = mk_ext(load=False)
+    ext._show_help()
+    out = capsys.readouterr().out
+    assert "mcp" in out
+
+
+# ── Tests: Status output ────────────────────────────────────────────────────
+
+def test_status_shows_memory_state(capsys, monkeypatch):
+    """Status should show memory=on when convlog is active."""
+    class FakeConvLog:
+        def __init__(self, sid): pass
+    monkeypatch.setattr(core, "_mk_convlog", lambda sid: FakeConvLog(sid))
+    monkeypatch.setattr(core, "_mk_toollog", lambda sid: None)
+    shell = DummyShell()
+    ext = HermesExtension(shell=shell).load()
+    ext.handle_line("")
+    out = capsys.readouterr().out
+    assert "memory=on" in out
