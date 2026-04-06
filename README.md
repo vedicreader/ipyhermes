@@ -112,10 +112,13 @@ Notes appear in the AI context as `<note>` blocks rather than `<code>` blocks. W
 %ipyhermes save mysession
 %ipyhermes load mysession
 %ipyhermes reset
-%ipyhermes clear-history
 %ipyhermes sessions
 %ipyhermes help
 %ipyhermes prompt
+%ipyhermes caveman
+%ipyhermes memory on
+%ipyhermes route
+%ipyhermes route auto
 ```
 
 - `%ipyhermes` — show current settings and config file paths
@@ -124,9 +127,13 @@ Notes appear in the AI context as `<note>` blocks rather than `<code>` blocks. W
 - `%ipyhermes save <file>` — save the current session to a `.ipynb` notebook
 - `%ipyhermes load <file>` — restore a session from a notebook
 - `%ipyhermes reset` — clear AI prompt history for the current session
-- `%ipyhermes clear-history` — clear the hermes multi-turn conversation history
 - `%ipyhermes sessions` — list resumable sessions for the current directory
 - `%ipyhermes prompt` — toggle prompt mode (all input → AI, `;` escapes to Python)
+- `%ipyhermes caveman` — toggle caveman mode (~75% fewer response tokens)
+- `%ipyhermes memory on|off` — toggle karma ConversationLog persistence (on by default when karma is installed)
+- `%ipyhermes route` — show provider quota status (requires bhoga)
+- `%ipyhermes route auto` — auto-select best provider based on quota (requires bhoga)
+- `%ipyhermes route <provider>` — force a specific provider
 - `%ipyhermes help` — show command reference
 
 ## Tools
@@ -261,8 +268,15 @@ On load, `ipyhermes` injects these into the IPython namespace (when available):
 - **karma**: `dev_context`, `search_code`, `index_repo`, `index_env`, `add_practice`, `log_decision`, `query_practices`, `search_decisions`
 - **webba**: `web_search`, `web_fetch`
 - **shortcutpy**: `shortcut`, `ask_for_text`, `choose_from_menu`, `show_result`, `compile_file`, `compile_source`
+- **bgterm**: `start_bgterm`, `write_stdin`, `close_bgterm` — persistent background shell sessions for multi-step workflows
+- **exhash**: `lnhashview_file`, `exhash_file` — hash-addressed file editing immune to line number drift
+- **bhoga**: `bhoga_router`, `apply_to_hermes` — quota-aware provider routing
 - **safecmd**: `bash`, `ex`, `sed`
 - **pyskills**: `doc`
+
+## Karma ConversationLog (Always-On)
+
+When [karma](https://github.com/vedicreader/karma) is installed, `ipyhermes` automatically creates a `ConversationLog` at extension load time. All AI prompts and responses are persisted via karma's session system. Toggle with `%ipyhermes memory on|off`.
 
 ## Configuration
 

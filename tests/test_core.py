@@ -15,7 +15,7 @@ from ipyhermes.core import (EXTENSION_NS, LAST_PROMPT, LAST_RESPONSE, RESET_LINE
     _shell_names, _shell_refs, _run_shell_refs,
     transform_prompt_mode,
     _discover_skills, _skills_xml, _build_sysp, _strip_thinking, _extract_code_blocks, _eval_code_blocks, load_skill,
-    _git_repo_root, _list_sessions, resume_session, _hermes_session_id, _mk_convlog, _mk_toollog)
+    _git_repo_root, _list_sessions, resume_session, _hermes_session_id, _mk_convlog)
 
 
 # ── Test doubles ─────────────────────────────────────────────────────────────
@@ -115,9 +115,8 @@ def _config_paths(monkeypatch, tmp_path):
         async def astream(self, prompt, sp=None, hist=None):
             yield ""
     monkeypatch.setattr(core, "_mk_agent", lambda *a, **kw: StubAgent(**kw))
-    # Stub karma/litesearch so tests don't require them
+    # Stub karma so tests don't require it
     monkeypatch.setattr(core, "_mk_convlog", lambda sid: None)
-    monkeypatch.setattr(core, "_mk_toollog", lambda sid: None)
 
 
 @pytest.fixture
@@ -1247,7 +1246,6 @@ def test_convlog_always_initialized(monkeypatch):
         def __init__(self, session_id): self.session_id = session_id
         def get_session(self, n=50): return []
     monkeypatch.setattr(core, "_mk_convlog", lambda sid: FakeConvLog(sid))
-    monkeypatch.setattr(core, "_mk_toollog", lambda sid: None)
     shell = DummyShell()
     ext = HermesExtension(shell=shell)
     assert ext._convlog is not None
@@ -1257,7 +1255,6 @@ def test_convlog_always_initialized(monkeypatch):
 def test_convlog_none_when_karma_missing(monkeypatch):
     """ConversationLog should be None if karma is not installed."""
     monkeypatch.setattr(core, "_mk_convlog", lambda sid: None)
-    monkeypatch.setattr(core, "_mk_toollog", lambda sid: None)
     shell = DummyShell()
     ext = HermesExtension(shell=shell)
     assert ext._convlog is None
@@ -1273,44 +1270,6 @@ def test_memory_on_off_still_works(capsys, monkeypatch):
     ext.handle_line("memory off")
     assert "Memory off" in capsys.readouterr().out
 
-
-# ── Tests: Phase 2b - ToolCallLog ────────────────────────────────────────────
-
-def test_toollog_initialized(monkeypatch):
-    """ToolCallLog should be initialized alongside the extension."""
-    class FakeToolLog:
-        def __init__(self, session_id): self.session_id = session_id
-        def search(self, q, k=10): return []
-        def recent(self, n=20): return []
-    monkeypatch.setattr(core, "_mk_toollog", lambda sid: FakeToolLog(sid))
-    shell = DummyShell()
-    ext = HermesExtension(shell=shell)
-    assert ext._toollog is not None
-    assert ext._toollog.session_id == "ipyhermes-1"
-    # Functions injected into namespace
-    assert 'search_tool_calls' in shell.user_ns
-    assert 'recent_tool_calls' in shell.user_ns
-
-
-def test_toollog_none_when_litesearch_missing(monkeypatch):
-    """ToolCallLog should be None if litesearch is not available."""
-    monkeypatch.setattr(core, "_mk_toollog", lambda sid: None)
-    shell = DummyShell()
-    ext = HermesExtension(shell=shell)
-    assert ext._toollog is None
-    assert 'search_tool_calls' not in shell.user_ns
-
-
-def test_toollog_module_standalone(tmp_path):
-    """ToolCallLog should work as a standalone module with in-memory DB."""
-    try:
-        from ipyhermes.toollog import ToolCallLog
-        log = ToolCallLog(session_id='test', db_path=str(tmp_path / 'test.db'))
-        log.log('bash', 'ls -la', '/home\n/tmp', duration_ms=42.5, success=True)
-        recent = log.recent(n=5, session_id='test')
-        assert len(recent) >= 0  # may be 0 if FTS not set up for schema query
-    except ImportError:
-        pytest.skip("litesearch not installed")
 
 
 # ── Tests: Phase 3 - bhoga route command ─────────────────────────────────────
@@ -1368,80 +1327,6 @@ def test_handle_route_force_provider(capsys, monkeypatch):
     assert "Provider forced to" in out
 
 
-# ── Tests: Phase 4 - MCP ────────────────────────────────────────────────────
-
-def test_handle_mcp_no_config(capsys, tmp_path, monkeypatch):
-    """mcp list should handle missing config gracefully."""
-    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'nonexistent'))
-    _,ext = mk_ext(load=False)
-    ext._handle_mcp("list")
-    out = capsys.readouterr().out
-    assert "No hermes config" in out
-
-
-def test_handle_mcp_with_servers(capsys, tmp_path, monkeypatch):
-    """mcp list should show configured servers."""
-    hermes_home = tmp_path / '.hermes'
-    hermes_home.mkdir()
-    cfg = hermes_home / 'config.yaml'
-    import yaml
-    cfg.write_text(yaml.dump({
-        'mcp_servers': {
-            'github': {'command': 'npx @mcp/github', 'enabled': True},
-            'disabled-server': {'url': 'http://example.com', 'enabled': False},
-        }
-    }))
-    monkeypatch.setenv('HERMES_HOME', str(hermes_home))
-    _,ext = mk_ext(load=False)
-    ext._handle_mcp("list")
-    out = capsys.readouterr().out
-    assert "github" in out
-    assert "✓" in out
-    assert "disabled-server" in out
-    assert "✗" in out
-
-
-def test_handle_mcp_unknown_subcommand(capsys):
-    """mcp with unknown subcommand should show error."""
-    _,ext = mk_ext(load=False)
-    ext._handle_mcp("foobar")
-    out = capsys.readouterr().out
-    assert "Unknown mcp subcommand" in out
-
-
-def test_mcp_server_tools_defined():
-    """MCP server should define all expected tools."""
-    from ipyhermes.mcp_server import _get_tools
-    tools = _get_tools()
-    names = {t['name'] for t in tools}
-    assert 'dev_context' in names
-    assert 'search_code' in names
-    assert 'index_repo' in names
-    assert 'add_practice' in names
-    assert 'query_practices' in names
-    assert 'log_decision' in names
-    assert 'search_decisions' in names
-    assert 'search_tool_calls' in names
-
-
-def test_mcp_call_tool_unknown():
-    """MCP _call_tool should return error for unknown tools."""
-    from ipyhermes.mcp_server import _call_tool
-    result = json.loads(_call_tool("nonexistent_tool", {}))
-    assert "error" in result
-    assert "Unknown tool" in result["error"]
-
-
-def test_mcp_call_tool_handles_missing_dependency():
-    """MCP _call_tool should handle missing dependencies gracefully."""
-    from ipyhermes.mcp_server import _call_tool
-    # search_tool_calls may fail if litesearch not installed, but shouldn't crash
-    result = _call_tool("search_tool_calls", {"query": "test"})
-    parsed = json.loads(result) if isinstance(result, str) else result
-    # Either returns valid results or an error dict - never crashes
-    assert isinstance(parsed, (list, dict))
-
-
 # ── Tests: Help text includes new commands ───────────────────────────────────
 
 def test_help_includes_route(capsys):
@@ -1449,12 +1334,6 @@ def test_help_includes_route(capsys):
     ext._show_help()
     out = capsys.readouterr().out
     assert "route" in out
-
-def test_help_includes_mcp(capsys):
-    _,ext = mk_ext(load=False)
-    ext._show_help()
-    out = capsys.readouterr().out
-    assert "mcp" in out
 
 
 # ── Tests: Status output ────────────────────────────────────────────────────
@@ -1464,7 +1343,6 @@ def test_status_shows_memory_state(capsys, monkeypatch):
     class FakeConvLog:
         def __init__(self, sid): pass
     monkeypatch.setattr(core, "_mk_convlog", lambda sid: FakeConvLog(sid))
-    monkeypatch.setattr(core, "_mk_toollog", lambda sid: None)
     shell = DummyShell()
     ext = HermesExtension(shell=shell).load()
     ext.handle_line("")

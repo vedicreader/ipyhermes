@@ -33,7 +33,6 @@ dependencies = [
 
 [project.scripts]
 ipyhermes = "ipyhermes.cli:run"
-ipyhermes-mcp = "ipyhermes.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["ipyhermes*"]

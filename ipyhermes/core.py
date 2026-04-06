@@ -595,13 +595,6 @@ def _mk_convlog(session_id):
         return ConversationLog(session_id=session_id)
     except ImportError: return None
 
-def _mk_toollog(session_id):
-    "Create a ToolCallLog if litesearch is available, else None."
-    try:
-        from ipyhermes.toollog import ToolCallLog
-        return ToolCallLog(session_id=session_id)
-    except ImportError: return None
-
 def _inject_webba(ns:dict):
     try:
         import webba
@@ -721,8 +714,6 @@ class HermesExtension:
         # ── karma ConversationLog (always-on when karma is installed) ──
         sid = _hermes_session_id(getattr(getattr(shell, 'history_manager', None), 'session_number', 0))
         self._convlog       = _mk_convlog(sid)
-        # ── tool call log ─────────────────────────────────────────────
-        self._toollog       = _mk_toollog(sid)
         # ── agents (hermes-agent memory enabled via session_id) ────────────
         self._exec = _mk_agent(self.model, self.provider,
                                ['terminal', 'web', 'execute_code', 'browser'],
@@ -740,10 +731,6 @@ class HermesExtension:
         _inject_bgterm(ns)
         _inject_exhash(ns)
         _inject_bhoga(ns)
-        # inject tool-call search into namespace
-        if self._toollog is not None:
-            ns.setdefault('search_tool_calls', self._toollog.search)
-            ns.setdefault('recent_tool_calls', self._toollog.recent)
         try:
             from safecmd import bash, ex, sed
             from pyskills import doc
@@ -1099,7 +1086,6 @@ class HermesExtension:
             ("caveman",            "Toggle caveman mode (~75% fewer tokens)"),
             ("memory on|off",      "Toggle karma ConversationLog persistence"),
             ("route [auto|<prov>]", "Show quota / auto-route / force provider (bhoga)"),
-            ("mcp [list]",         "List configured MCP servers and tools"),
             ("save <file>",        "Save session to .ipynb"),
             ("load <file>",        "Load session from .ipynb"),
             ("reset",              "Clear AI prompts from current session"),
@@ -1148,35 +1134,6 @@ class HermesExtension:
                                _make_approval_cb(), session_id=sid)
         return print(f"Provider forced to: {arg}")
 
-    # ── MCP ────────────────────────────────────────────────────────────────
-    def _handle_mcp(self, arg: str):
-        "Handle %ipyhermes mcp [list]."
-        if not arg or arg == "list":
-            return self._mcp_list()
-        return print(f"Unknown mcp subcommand: {arg!r}. Try: %ipyhermes mcp list")
-
-    def _mcp_list(self):
-        "List configured MCP servers from hermes config."
-        import yaml
-        _HH = Path(os.environ.get('HERMES_HOME', '~/.hermes')).expanduser()
-        cfg_path = _HH / 'config.yaml'
-        if not cfg_path.exists():
-            cfg_path = _HH / 'cli-config.yaml'
-        if not cfg_path.exists():
-            return print("No hermes config found. MCP servers are configured in ~/.hermes/config.yaml")
-        try:
-            cfg = yaml.safe_load(cfg_path.read_text()) or {}
-        except Exception as e:
-            return print(f"Error reading config: {e}")
-        servers = cfg.get('mcp_servers', {})
-        if not servers: return print("No MCP servers configured in hermes config.")
-        print(f"MCP servers ({len(servers)}):\n")
-        for name, info in servers.items():
-            cmd = info.get('command', info.get('url', '?'))
-            enabled = info.get('enabled', True)
-            status = "✓" if enabled else "✗"
-            print(f"  {status} {name:20s}  {cmd}")
-
     # ── handle_line (magic dispatcher) ─────────────────────────────────────
     def handle_line(self, line: str):
         line = line.strip()
@@ -1217,8 +1174,6 @@ class HermesExtension:
                 return print(f"memory={'on' if self._convlog is not None else 'off'}")
         if cmd == "route":
             return self._handle_route(clean)
-        if cmd == "mcp":
-            return self._handle_mcp(clean)
         if cmd == "save":
             if not clean: return print("Usage: %ipyhermes save <filename>")
             path, ncode, nprompt = self.save_notebook(clean)
